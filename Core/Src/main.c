@@ -27,7 +27,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include "motor_hw.h"
+#include "motor_control.h"
+#include "mt6701.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,6 +52,7 @@
 
 /* USER CODE BEGIN PV */
 
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -59,7 +63,6 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
 /**
@@ -70,7 +73,12 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  float id_ref_a = 0.0f, iq_ref_a = 0.0f;
+  float id_a = 0.0f, iq_a = 0.0f;
+  float speed_rad_s = 0.0f;
+  float angle_rad = 0.0f;
+  uint32_t zero_start_tick;
+  bool current_ready, dq_valid, speed_valid;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -99,6 +107,48 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  MT6701_Init();
+  MotorControl_Init(); /* 仅初始化软件状态和PI参数；此调用本身不启动ADC、定时器或闭环。 */
+  (void)MotorControl_SetIqTarget(0.0f);
+  /* 成功后SPI DMA、TIM3速度节拍、TIM1触发的ADC采样会由硬件自动持续触发。 */
+  if (!MotorHw_Init())
+  {
+    Error_Handler();
+  }
+
+  /* ADC启动后等待两路零点校准；超时则禁止后续PWM输出。 */
+  zero_start_tick = HAL_GetTick();
+  while (!MotorControl_IsCurrentReady())
+  {
+    if ((uint32_t)(HAL_GetTick() - zero_start_tick) >= 1000U)
+    {
+      Error_Handler();
+    }
+  }
+
+  if (!MotorHw_StartPwm())
+  {
+    Error_Handler();
+  }
+  MotorHw_SetPhaseDuty(0.5f, 0.0f, 0.0f); /* 施加固定U轴方向对齐电压矢量。 */
+  HAL_Delay(400U);                         /* 仅用于一次性上电对齐，不得放入ISR。 */
+  if (!MT6701_GetMechanicalAngleRad(&angle_rad))
+  {
+    MotorHw_StopPwm();
+    Error_Handler();
+  }
+  if (!MotorControl_SetElectricalZeroAngle(angle_rad))
+  {
+    MotorHw_StopPwm();
+    Error_Handler();
+  }
+  MotorHw_StopPwm();                       /* 关闭通道，不能用三相0占空比代替。 */
+  /* 后续反馈仍由ADC/TIM中断自动更新；本main没有调用MotorControl_EnableCurrentLoop，
+     因此不会运行电流PI/SVPWM，也不会由控制中断更新PWM。 */
+  if (MotorControl_IsCurrentLoopFaulted())
+  {
+    Error_Handler();
+  }
 
   /* USER CODE END 2 */
 
@@ -109,6 +159,18 @@ int main(void)
 
     /* USER CODE END WHILE */
 
+    current_ready = MotorControl_IsCurrentReady();
+    id_a = 0.0f;
+    iq_a = 0.0f;
+    dq_valid = MotorControl_GetCurrentDQ(&id_a, &iq_a);
+    (void)MotorControl_GetCurrentTargets(&id_ref_a, &iq_ref_a);
+    speed_rad_s = 0.0f;
+    speed_valid = MotorControl_GetMechanicalSpeed(&speed_rad_s);
+    printf("Id_ref:%.3f Id:%.3f Iq_ref:%.3f Iq:%.3f dq:%u ready:%u speed:%.3f valid:%u\r\n",
+           id_ref_a, id_a, iq_ref_a, iq_a, (unsigned int)dq_valid,
+           (unsigned int)current_ready,
+           speed_rad_s, (unsigned int)speed_valid);
+    HAL_Delay(100);
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

@@ -1,30 +1,11 @@
 #include "foc_math.h"
 #include "arm_math.h"
+#include <math.h>
+#include <stddef.h>
 
-/*
-*********************************************************************************************************
-*   函 数 名: FOC_sin_f32
-*   功能说明: 计算正弦值
-*   形    参: x - 输入角度，单位rad
-*   返 回 值: sin(x)
-*********************************************************************************************************
-*/
-float FOC_sin_f32(float x)
-{
-    return arm_sin_f32(x);
-}
-/*
-*********************************************************************************************************
-*   函 数 名: FOC_cos_f32   
-*   功能说明: 计算余弦值
-*   形    参: x - 输入角度，单位rad
-*   返 回 值: cos(x)
-*********************************************************************************************************
-*/
-float FOC_cos_f32(float x)
-{
-    return arm_cos_f32(x);
-}
+#define FOC_HALF_F           (0.5f)
+#define FOC_SQRT3_BY_2_F     (0.86602540378443864676f)
+
 
 /*
 *********************************************************************************************************
@@ -46,7 +27,7 @@ void FOC_SinCos(float electrical_angle_rad, float *sin_value, float *cos_value)
         return;
     }
 
-    arm_sin_cos_f32(electrical_angle_rad, &sin_theta, &cos_theta);
+    arm_sin_cos_f32(FOC_RadToDeg(electrical_angle_rad), &sin_theta, &cos_theta);
     if (sin_value != NULL)
     {
         *sin_value = sin_theta;
@@ -75,28 +56,6 @@ void FOC_Clarke(float Ia, float Ib, float *pIalpha,float *pIbeta)
     }
 
     arm_clarke_f32(Ia, Ib, pIalpha, pIbeta);
-
-}
-
-/*
-*********************************************************************************************************
-*   函 数 名: FOC_InvClarke
-*   功能说明: 将αβ平面物理量还原为U/V相量；W相由三相和为零的约束确定
-*   形    参: Ialpha - α轴输入，单位A或V
-*             Ibeta  - β轴输入，单位A或V
-*             pIa    - U相输出，可为NULL
-*             pIb    - V相输出，可为NULL
-*   返 回 值: 无
-*********************************************************************************************************
-*/
-void FOC_InvClarke(float Ialpha, float Ibeta, float *pIa,float *pIb)
-{
-    if (pIa == NULL || pIb == NULL)
-    {
-        return;
-    }
-
-    arm_inv_clarke_f32(Ialpha, Ibeta, pIa, pIb);
 
 }
 
@@ -145,4 +104,121 @@ void FOC_InvPark(float Id, float Iq, float *pIalpha, float *pIbeta, float sinVal
     }
     
     arm_inv_park_f32(Id, Iq, pIalpha, pIbeta, sinVal, cosVal);
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: FOC_CurrentToDQ
+*   功能说明: 将满足三相电流和为零的U/V相电流变换到转子dq坐标
+*   形    参: iu_a/iv_a            - 两相电流，单位A，相序和正方向由调用者确认
+*             electrical_angle_rad - 已校准的转子电角度，单位rad
+*             id_a/iq_a           - dq轴电流输出，单位A
+*             所有浮点输入须由调用者保证为有限值
+*   返 回 值: 输出指针有效时为true；指针错误时返回false且不写输出
+*********************************************************************************************************
+*/
+bool FOC_CurrentToDQ(float iu_a, float iv_a, float electrical_angle_rad,
+                     float *id_a, float *iq_a)
+{
+    float alpha_a;
+    float beta_a;
+    float sin_theta;
+    float cos_theta;
+
+    if ((id_a == NULL) || (iq_a == NULL) || (id_a == iq_a))
+    {
+        return false;
+    }
+
+    FOC_Clarke(iu_a, iv_a, &alpha_a, &beta_a);
+    FOC_SinCos(electrical_angle_rad, &sin_theta, &cos_theta);
+    FOC_Park(alpha_a, beta_a, id_a, iq_a, sin_theta, cos_theta);
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: FocSvpwm_ComputeDuty
+*   功能说明: 反Park后还原三相电压，以零序注入生成居中的三相占空比
+*   形    参: electrical_angle_rad - 电角度，单位rad
+*             ud_norm/uq_norm     - dq电压，按母线电压归一化
+*             duty_out            - 调用者提供的输出存储
+*             所有浮点输入须由调用者保证为有限值
+*   返 回 值: 输出指针有效时为true；指针错误时返回false且输出不变
+*********************************************************************************************************
+*/
+bool FocSvpwm_ComputeDuty(float electrical_angle_rad, float ud_norm, float uq_norm,
+                          FocPhaseDuty_t *duty_out)
+{
+    float sin_theta, cos_theta, alpha, beta;
+    float u, v, w, max_u, min_u, span, common;
+
+    if (duty_out == NULL)
+    {
+        return false;
+    }
+
+    FOC_SinCos(electrical_angle_rad, &sin_theta, &cos_theta);
+    FOC_InvPark(ud_norm, uq_norm, &alpha, &beta, sin_theta, cos_theta);
+
+    // 逆Clarke的三相相电压加入同一个零序偏置，不改变线电压。
+    u = alpha;
+    v = -FOC_HALF_F * alpha + FOC_SQRT3_BY_2_F * beta;
+    w = -FOC_HALF_F * alpha - FOC_SQRT3_BY_2_F * beta;
+    max_u = fmaxf(u, fmaxf(v, w));
+    min_u = fminf(u, fminf(v, w));
+    span = max_u - min_u;
+
+    if (span > 1.0f)
+    {
+        // 电压矢量整体缩放，避免逐轴钳位造成方向偏移。
+        u /= span;
+        v /= span;
+        w /= span;
+        max_u /= span;
+        min_u /= span;
+    }
+
+    common = FOC_HALF_F * (max_u + min_u);
+    duty_out->duty_u = FOC_ClampF32(FOC_HALF_F + u - common, 0.0f, 1.0f);
+    duty_out->duty_v = FOC_ClampF32(FOC_HALF_F + v - common, 0.0f, 1.0f);
+    duty_out->duty_w = FOC_ClampF32(FOC_HALF_F + w - common, 0.0f, 1.0f);
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: FOC_CyclicDiff
+*   功能说明: 将相邻循环量之差折返到[-半周期, 半周期)，供角度累计或位置误差计算使用
+*             当两次采样真实变化超过半周期时无法判定实际旋转方向
+*   形    参: current_value  - 当前值，单位自定义
+*             previous_value - 上一次值，单位与当前值相同
+*             cycle_period   - 周期范围，必须大于0
+*   返 回 值: 最短有符号差值；周期无效时返回0
+*********************************************************************************************************
+*/
+float FOC_CyclicDiff(float current_value, float previous_value, float cycle_period)
+{
+    float difference;
+    float half_period;
+
+    if (cycle_period <= 0.0f)
+    {
+        return 0.0f;
+    }
+
+    difference = current_value - previous_value;
+    half_period = cycle_period * 0.5f;
+
+    while (difference >= half_period)
+    {
+        difference -= cycle_period;
+    }
+
+    while (difference < -half_period)
+    {
+        difference += cycle_period;
+    }
+
+    return difference;
 }

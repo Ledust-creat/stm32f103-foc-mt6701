@@ -1,16 +1,35 @@
 #ifndef FOC_CONFIG_H
 #define FOC_CONFIG_H
-// 单片机配置参数：
-#define motor_pwm_freq 20000      // 驱动桥pwm频率，Hz
-#define motor_speed_calc_freq 930 // 电机速度计算频率，Hz
-// 电机物理参数：
-#define POLE_PAIRS 7 // 极对数
+/*
+*********************************************************************************************************
+*   宏定义
+*********************************************************************************************************
+*/
 
-// 电路参数：
-#define R_SHUNT 0.02           // 电流采样电阻，欧姆
-#define OP_GAIN 50             // 运放放大倍数
-#define MAX_CURRENT 2          // 最大q轴电流，安培A
-#define ADC_REFERENCE_VOLT 3.3 // 电流采样adc参考电压，伏
-#define ADC_BITS 12            // ADC精度，bit
+/* Board timing; TIM1 center-aligned with RCR=4 gives an approximately 8 kHz ADC loop. */
+#define motor_pwm_freq 20000U
+#define motor_speed_calc_freq 930U
+#define MOTOR_PWM_REPETITION_COUNTER 4U
+#define MOTOR_CURRENT_LOOP_FREQ_HZ \
+    (((float)motor_pwm_freq * 2.0f) / ((float)MOTOR_PWM_REPETITION_COUNTER + 1.0f))
+#define MOTOR_CURRENT_LOOP_PERIOD_S (1.0f / MOTOR_CURRENT_LOOP_FREQ_HZ)
+
+#define POLE_PAIRS 7U
+#define R_SHUNT 0.02f
+#define OP_GAIN 50.0f
+#define ADC_REFERENCE_VOLT 3.3f
+#define ADC_BITS 12U
+
+/* 1.5 A软件限值低于理论约±1.65 A的ADC满量程；仍须满足硬件额定范围。 */
+#define MOTOR_CURRENT_LIMIT_A 1.55f
+
+/* 电流误差(A)到SVPWM归一化电压的PI初值；0表示不会主动产生电压，调参后再填写。 */
+#define MOTOR_CURRENT_ID_KP 0.0f
+#define MOTOR_CURRENT_ID_KI_PER_S 0.0f
+#define MOTOR_CURRENT_IQ_KP 0.0f
+#define MOTOR_CURRENT_IQ_KI_PER_S 0.0f
+
+/* 每轴限幅sqrt(1/6)，确保dq矢量在线性调制范围内。 */
+#define MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM 0.40824829f
 
 #endif
