@@ -28,6 +28,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include "foc_config.h"
 #include "motor_hw.h"
 #include "motor_control.h"
 #include "mt6701.h"
@@ -63,6 +64,37 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/*
+*********************************************************************************************************
+*   函 数 名: Main_PrintVofaIfDue
+*   功能说明: 在主循环按20 ms节拍发送ADC原始值和校零后的两相电流；不得在中断中调用
+*   返 回 值: 无；printf由USART2的fputc发送，发送超时由重定向层限制
+*********************************************************************************************************
+*/
+static void Main_PrintVofaIfDue(void)
+{
+  static uint32_t last_print_tick;
+  float current_u_a = 0.0f, current_v_a = 0.0f;
+  uint32_t raw_u, raw_v;
+  uint32_t now = HAL_GetTick();
+
+  if ((uint32_t)(now - last_print_tick) < MOTOR_CURRENT_TEST_PRINT_PERIOD_MS)
+  {
+    return;
+  }
+  last_print_tick = now;
+
+  raw_u = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
+  raw_v = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
+  (void)MotorControl_GetCurrentU(&current_u_a);
+  (void)MotorControl_GetCurrentV(&current_v_a);
+  /* FireWater列顺序：ADC1原始值、ADC2原始值、U电流(A)、V电流(A)、校零完成、故障。 */
+  printf("%lu,%lu,%.4f,%.4f,%u,%u\r\n",
+         (unsigned long)raw_u, (unsigned long)raw_v,
+         current_u_a, current_v_a,
+         (unsigned int)MotorControl_IsCurrentReady(),
+         (unsigned int)MotorControl_IsCurrentLoopFaulted());
+}
 /* USER CODE END 0 */
 
 /**
@@ -73,12 +105,11 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  float id_ref_a = 0.0f, iq_ref_a = 0.0f;
-  float id_a = 0.0f, iq_a = 0.0f;
-  float speed_rad_s = 0.0f;
+#if MOTOR_CURRENT_TEST_ENABLE
   float angle_rad = 0.0f;
-  uint32_t zero_start_tick;
-  bool current_ready, dq_valid, speed_valid;
+  uint32_t start_tick;
+  float id_a, iq_a;
+#endif
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -116,39 +147,67 @@ int main(void)
     Error_Handler();
   }
 
-  /* ADC启动后等待两路零点校准；超时则禁止后续PWM输出。 */
-  zero_start_tick = HAL_GetTick();
+#if MOTOR_CURRENT_TEST_ENABLE
+  /* 闭环测试才等待校零；仅观察时即使校零失败，也继续打印ADC原始值。 */
+  start_tick = HAL_GetTick();
   while (!MotorControl_IsCurrentReady())
   {
-    if ((uint32_t)(HAL_GetTick() - zero_start_tick) >= 1000U)
+    if ((uint32_t)(HAL_GetTick() - start_tick) >= 1000U)
     {
       Error_Handler();
     }
   }
 
+  /* 仅启用测试时通电对齐；ADC过流仍由中断立即关PWM。 */
   if (!MotorHw_StartPwm())
   {
     Error_Handler();
   }
-  MotorHw_SetPhaseDuty(0.5f, 0.0f, 0.0f); /* 施加固定U轴方向对齐电压矢量。 */
-  HAL_Delay(400U);                         /* 仅用于一次性上电对齐，不得放入ISR。 */
-  if (!MT6701_GetMechanicalAngleRad(&angle_rad))
+  MotorHw_SetPhaseDuty(0.5f, 0.0f, 0.0f);
+  HAL_Delay(400U);
+  MotorHw_StopPwm(); // 对齐结束后关闭通道，不能用0占空比代替。
+  if (!MT6701_GetMechanicalAngleRad(&angle_rad) ||
+      !MotorControl_SetElectricalZeroAngle(angle_rad) ||
+      MotorControl_IsCurrentLoopFaulted())
+  {
+    Error_Handler();
+  }
+
+  /* 零位设置会使旧dq反馈失效；等下一次ADC和TIM3反馈后再启动电流环。 */
+  start_tick = HAL_GetTick();
+	MotorControl_GetCurrentDQ(&id_a, &iq_a);
+
+  if (!MotorHw_StartPwm())
+  {
+    Error_Handler();
+  }
+  if (!MotorControl_EnableCurrentLoop())
   {
     MotorHw_StopPwm();
     Error_Handler();
   }
-  if (!MotorControl_SetElectricalZeroAngle(angle_rad))
+
+  /* 一次性测试：零目标基线 → 小Iq阶跃 → 无论是否故障都停PWM。 */
+  start_tick = HAL_GetTick();
+  while (((uint32_t)(HAL_GetTick() - start_tick) < MOTOR_CURRENT_TEST_BASELINE_MS) &&
+         !MotorControl_IsCurrentLoopFaulted())
   {
-    MotorHw_StopPwm();
-    Error_Handler();
+    Main_PrintVofaIfDue();
   }
-  MotorHw_StopPwm();                       /* 关闭通道，不能用三相0占空比代替。 */
-  /* 后续反馈仍由ADC/TIM中断自动更新；本main没有调用MotorControl_EnableCurrentLoop，
-     因此不会运行电流PI/SVPWM，也不会由控制中断更新PWM。 */
-  if (MotorControl_IsCurrentLoopFaulted())
+  if (!MotorControl_IsCurrentLoopFaulted())
   {
-    Error_Handler();
+    (void)MotorControl_SetIqTarget(MOTOR_CURRENT_TEST_IQ_A);
+    start_tick = HAL_GetTick();
+    while (((uint32_t)(HAL_GetTick() - start_tick) < MOTOR_CURRENT_TEST_DURATION_MS) &&
+           !MotorControl_IsCurrentLoopFaulted())
+    {
+      Main_PrintVofaIfDue();
+    }
   }
+  (void)MotorControl_SetIqTarget(0.0f);
+  MotorControl_DisableCurrentLoop();
+  MotorHw_StopPwm();
+#endif
 
   /* USER CODE END 2 */
 
@@ -159,18 +218,7 @@ int main(void)
 
     /* USER CODE END WHILE */
 
-    current_ready = MotorControl_IsCurrentReady();
-    id_a = 0.0f;
-    iq_a = 0.0f;
-    dq_valid = MotorControl_GetCurrentDQ(&id_a, &iq_a);
-    (void)MotorControl_GetCurrentTargets(&id_ref_a, &iq_ref_a);
-    speed_rad_s = 0.0f;
-    speed_valid = MotorControl_GetMechanicalSpeed(&speed_rad_s);
-    printf("Id_ref:%.3f Id:%.3f Iq_ref:%.3f Iq:%.3f dq:%u ready:%u speed:%.3f valid:%u\r\n",
-           id_ref_a, id_a, iq_ref_a, iq_a, (unsigned int)dq_valid,
-           (unsigned int)current_ready,
-           speed_rad_s, (unsigned int)speed_valid);
-    HAL_Delay(100);
+    Main_PrintVofaIfDue();
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

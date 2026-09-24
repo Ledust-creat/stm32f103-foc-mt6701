@@ -13,11 +13,11 @@ typedef enum
 
 /* 清除软件反馈/校准/PI状态；必须在ADC/TIM3中断启动前调用，不会启动硬件或电流环。 */
 void MotorControl_Init(void);
-/* 保存对齐时读取的机械角作为电角度零位；非法输入返回false。 */
+/* 保存机械角作为电角度零位；调用者须保证输入有效，闭环前应先做转子对齐。 */
 bool MotorControl_SetElectricalZeroAngle(float mechanical_angle_rad);
 /* 设置q轴电流目标(A)，超出±1.55A时钳位；d轴目标固定为0A。 */
 bool MotorControl_SetIqTarget(float iq_ref_a);
-/* 显式使能电流闭环：就绪且PWM已启动后调用；之后ADC中断才运行PI/SVPWM。 */
+/* 显式使能电流闭环：电流、dq、速度均有效且PWM已启动后调用。 */
 bool MotorControl_EnableCurrentLoop(void);
 /* 禁用电流环并清除PI状态；不清除已锁存的保护故障。 */
 void MotorControl_DisableCurrentLoop(void);
@@ -38,6 +38,8 @@ bool MotorControl_GetCurrentV(float *current_v_a);
 bool MotorControl_GetCurrentDQ(float *id_a, float *iq_a);
 /* 同一组电流目标快照，单位A；当前d轴目标固定为0A。 */
 bool MotorControl_GetCurrentTargets(float *id_ref_a, float *iq_ref_a);
+/* 最近一次q轴归一化电压指令；停机或故障后为0，供VOFA低频观察。 */
+bool MotorControl_GetVoltageQ(float *uq_norm);
 /* 机械速度(rad/s)；编码器停更时返回false且不写输出。 */
 bool MotorControl_GetMechanicalSpeed(float *speed_rad_s);
 

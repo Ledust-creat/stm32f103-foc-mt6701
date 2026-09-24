@@ -229,7 +229,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 /*
 *********************************************************************************************************
 *   函 数 名: HAL_TIM_PeriodElapsedCallback
-*   功能说明: TIM3周期事件只转交速度估算；TIM1不参与此回调
+*   功能说明: TIM3周期事件更新速度；若检测到编码器停更或超速则立即关闭PWM
 *********************************************************************************************************
 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -238,5 +238,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim == &htim3)
     {
         MotorControl_OnSpeedTickISR();
+        if (MotorControl_IsCurrentLoopFaulted())
+        {
+            MotorHw_StopPwm();
+        }
     }
 }

@@ -117,7 +117,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* uartHandle)
 int fputc(int c, FILE *stream)
 {
   uint8_t ch[] = {(uint8_t)c};
-  HAL_UART_Transmit(&huart2, ch, 1, HAL_MAX_DELAY);
+  (void)stream;
+  if (HAL_UART_Transmit(&huart2, ch, 1, 2U) != HAL_OK)
+  {
+    return EOF;
+  }
   return c;
 }
 
