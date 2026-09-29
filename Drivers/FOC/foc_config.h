@@ -6,36 +6,28 @@
 *********************************************************************************************************
 */
 
-/* Board timing; TIM1 center-aligned with RCR=4 gives an approximately 8 kHz ADC loop. */
-#define motor_pwm_freq 20000U
-#define motor_speed_calc_freq 930U
-#define MOTOR_PWM_REPETITION_COUNTER 4U
+/* TIM1中心对齐的上下边界均计重复次数：20 kHz、RCR=4产生约8 kHz ADC节拍。 */
+#define motor_pwm_freq 20000U              /* 三相PWM目标频率，单位Hz */
+#define motor_speed_calc_freq 930U         /* TIM3标称速度估算频率，单位Hz，实际约929 Hz */
+#define MOTOR_PWM_REPETITION_COUNTER 9U    /* TIM1重复计数器值；不是速度环分频 */
 #define MOTOR_CURRENT_LOOP_FREQ_HZ \
     (((float)motor_pwm_freq * 2.0f) / ((float)MOTOR_PWM_REPETITION_COUNTER + 1.0f))
-#define MOTOR_CURRENT_LOOP_PERIOD_S (1.0f / MOTOR_CURRENT_LOOP_FREQ_HZ)
+#define MOTOR_CURRENT_LOOP_PERIOD_S (1.0f / MOTOR_CURRENT_LOOP_FREQ_HZ) /* PI固定周期，单位s */
 
-#define POLE_PAIRS 7U
-#define R_SHUNT 0.02f
-#define OP_GAIN 50.0f
-#define ADC_REFERENCE_VOLT 3.3f
-#define ADC_BITS 12U
+#define POLE_PAIRS 7U                      /* 电机极对数；机械角乘此值得到电角度 */
+#define R_SHUNT 0.02f                      /* 相电流采样电阻，单位Ω */
+#define OP_GAIN 50.0f                      /* 采样放大器电压增益，无量纲 */
+#define ADC_REFERENCE_VOLT 3.3f            /* ADC参考电压，单位V；理论零电流中点为1.65 V */
+#define ADC_BITS 12U                       /* ADC分辨率，原始计数范围0～4095 */
 
-/* 1.5 A软件限值低于理论约±1.65 A的ADC满量程；仍须满足硬件额定范围。 */
+/* Iq目标及实测U/V/W过流限值；1.55 A低于理想±1.65 A量程，仍须满足硬件额定范围。 */
 #define MOTOR_CURRENT_LIMIT_A 1.55f
 
-/* d/q轴共用；电流误差(A)到归一化电压，初值为0，试验前手动调节并重新烧录。 */
-#define MOTOR_CURRENT_KP 0.05f             /* 比例系数，单位1/A */
-#define MOTOR_CURRENT_KI_PER_S 0.0f       /* 积分系数，单位1/(A·s) */
+/* d/q轴共用PI：A单位电流误差转换为按母线电压归一化的电压指令；手动改值后烧录。 */
+#define MOTOR_CURRENT_KP 0.65f             /* 比例系数，单位1/A */
+#define MOTOR_CURRENT_KI_PER_S 80.0f       /* 积分系数，单位1/(A·s) */
 
-/* 临时台架试验：默认关闭，关闭时上电不执行PWM转子对齐或电流闭环。 */
-#define MOTOR_CURRENT_TEST_ENABLE 1U               /* 先仅观察ADC；确认采样正确后再开启电流环测试 */
-#define MOTOR_CURRENT_TEST_IQ_A 0.05f               /* q轴阶跃目标，单位A */
-#define MOTOR_CURRENT_TEST_BASELINE_MS 200U         /* 零目标基线时间，单位ms */
-#define MOTOR_CURRENT_TEST_DURATION_MS 1000U        /* 阶跃保持时间，单位ms */
-#define MOTOR_CURRENT_TEST_SPEED_LIMIT_RAD_S 10.0f  /* 临时机械速度截止值，单位rad/s */
-#define MOTOR_CURRENT_TEST_PRINT_PERIOD_MS 20U      /* VOFA输出周期，单位ms */
-
-/* 每轴限幅sqrt(1/6)，确保dq矢量在线性调制范围内。 */
+/* 每轴限幅1/√6，保证最坏dq矢量幅值≤1/√3；这是电压限幅，不是电流限值。 */
 #define MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM 0.40824829f
 
 #endif

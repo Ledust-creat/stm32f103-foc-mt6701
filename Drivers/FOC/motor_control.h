@@ -2,6 +2,7 @@
 #define MOTOR_CONTROL_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "foc_math.h"
 
 typedef enum
@@ -13,11 +14,15 @@ typedef enum
 
 /* 清除软件反馈/校准/PI状态；必须在ADC/TIM3中断启动前调用，不会启动硬件或电流环。 */
 void MotorControl_Init(void);
+/* 256次无电流采样完成时返回true；不代表相序、极性或电角度零位已验证。 */
+bool MotorControl_IsCurrentReady(void);
 /* 保存机械角作为电角度零位；调用者须保证输入有效，闭环前应先做转子对齐。 */
 bool MotorControl_SetElectricalZeroAngle(float mechanical_angle_rad);
-/* 设置q轴电流目标(A)，超出±1.55A时钳位；d轴目标固定为0A。 */
+/* 设置d轴电流目标(A)，超出±1.55A时钳位。 */
+bool MotorControl_SetIdTarget(float id_ref_a);
+/* 设置q轴电流目标(A)，超出±1.55A时钳位。 */
 bool MotorControl_SetIqTarget(float iq_ref_a);
-/* 显式使能电流闭环：电流、dq、速度均有效且PWM已启动后调用。 */
+/* PWM启动后显式使能；要求校零完成、零位及编码器角度有效，不依赖速度反馈。 */
 bool MotorControl_EnableCurrentLoop(void);
 /* 禁用电流环并清除PI状态；不清除已锁存的保护故障。 */
 void MotorControl_DisableCurrentLoop(void);
@@ -30,13 +35,11 @@ MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
 /* 由motor_hw的TIM3 HAL回调自动调用；依据MT6701新帧更新机械速度。 */
 void MotorControl_OnSpeedTickISR(void);
 
-/* 电流零点已采满256帧；不代表相序或方向已验证。 */
-bool MotorControl_IsCurrentReady(void);
-bool MotorControl_GetCurrentU(float *current_u_a);
-bool MotorControl_GetCurrentV(float *current_v_a);
 /* 读取最新d/q电流，单位A；低频读取时两值可能跨一个ADC周期。 */
 bool MotorControl_GetCurrentDQ(float *id_a, float *iq_a);
-/* 同一组电流目标快照，单位A；当前d轴目标固定为0A。 */
+/* 临时串口诊断：读取最新U/V相电流，单位A；低频读取时两值可能跨一个ADC周期。 */
+bool MotorControl_GetPhaseCurrentUV(float *iu_a, float *iv_a);
+/* 读取d/q电流目标，单位A；返回实际保存的限幅后目标。 */
 bool MotorControl_GetCurrentTargets(float *id_ref_a, float *iq_ref_a);
 /* 最近一次q轴归一化电压指令；停机或故障后为0，供VOFA低频观察。 */
 bool MotorControl_GetVoltageQ(float *uq_norm);

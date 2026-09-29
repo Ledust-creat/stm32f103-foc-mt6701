@@ -67,32 +67,33 @@ void SystemClock_Config(void);
 /*
 *********************************************************************************************************
 *   函 数 名: Main_PrintVofaIfDue
-*   功能说明: 在主循环按20 ms节拍发送ADC原始值和校零后的两相电流；不得在中断中调用
+*   功能说明: 每20 ms发送Iq目标、U/V相电流、dq反馈、电压、速度及故障；不得在中断中调用
 *   返 回 值: 无；printf由USART2的fputc发送，发送超时由重定向层限制
 *********************************************************************************************************
 */
 static void Main_PrintVofaIfDue(void)
 {
   static uint32_t last_print_tick;
-  float current_u_a = 0.0f, current_v_a = 0.0f;
-  uint32_t raw_u, raw_v;
+  float id_ref_a = 0.0f, iq_ref_a = 0.0f;
+  float iu_a = 0.0f, iv_a = 0.0f;
+  float id_a = 0.0f, iq_a = 0.0f, uq_norm = 0.0f;
+  float speed_rad_s = 0.0f;
   uint32_t now = HAL_GetTick();
 
-  if ((uint32_t)(now - last_print_tick) < MOTOR_CURRENT_TEST_PRINT_PERIOD_MS)
+  if ((uint32_t)(now - last_print_tick) < 20U)
   {
     return;
   }
   last_print_tick = now;
 
-  raw_u = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
-  raw_v = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
-  (void)MotorControl_GetCurrentU(&current_u_a);
-  (void)MotorControl_GetCurrentV(&current_v_a);
-  /* FireWater列顺序：ADC1原始值、ADC2原始值、U电流(A)、V电流(A)、校零完成、故障。 */
-  printf("%lu,%lu,%.4f,%.4f,%u,%u\r\n",
-         (unsigned long)raw_u, (unsigned long)raw_v,
-         current_u_a, current_v_a,
-         (unsigned int)MotorControl_IsCurrentReady(),
+  (void)MotorControl_GetCurrentTargets(&id_ref_a, &iq_ref_a);
+  (void)MotorControl_GetPhaseCurrentUV(&iu_a, &iv_a);
+  (void)MotorControl_GetCurrentDQ(&id_a, &iq_a);
+  (void)MotorControl_GetVoltageQ(&uq_norm);
+  (void)MotorControl_GetMechanicalSpeed(&speed_rad_s);
+  // FireWater列顺序：Iq目标(A)、U/V相电流(A)、Id/Iq反馈(A)、Uq归一化、速度(rad/s)、故障。
+  printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u\r\n",
+         id_ref_a, iu_a, iv_a, id_a, iq_a, uq_norm, speed_rad_s,
          (unsigned int)MotorControl_IsCurrentLoopFaulted());
 }
 /* USER CODE END 0 */
@@ -105,11 +106,9 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-#if MOTOR_CURRENT_TEST_ENABLE
   float angle_rad = 0.0f;
   uint32_t start_tick;
-  float id_a, iq_a;
-#endif
+  FocPhaseDuty_t duty;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -140,75 +139,77 @@ int main(void)
   /* USER CODE BEGIN 2 */
   MT6701_Init();
   MotorControl_Init(); /* 仅初始化软件状态和PI参数；此调用本身不启动ADC、定时器或闭环。 */
-  (void)MotorControl_SetIqTarget(0.0f);
   /* 成功后SPI DMA、TIM3速度节拍、TIM1触发的ADC采样会由硬件自动持续触发。 */
   if (!MotorHw_Init())
   {
     Error_Handler();
   }
-
-#if MOTOR_CURRENT_TEST_ENABLE
-  /* 闭环测试才等待校零；仅观察时即使校零失败，也继续打印ADC原始值。 */
-  start_tick = HAL_GetTick();
-  while (!MotorControl_IsCurrentReady())
+  // 上电只测试一次；失败、过流或到时都进入同一个停机出口。
+  do
   {
-    if ((uint32_t)(HAL_GetTick() - start_tick) >= 1000U)
-    {
-      Error_Handler();
-    }
-  }
-
-  /* 仅启用测试时通电对齐；ADC过流仍由中断立即关PWM。 */
-  if (!MotorHw_StartPwm())
-  {
-    Error_Handler();
-  }
-  MotorHw_SetPhaseDuty(0.5f, 0.0f, 0.0f);
-  HAL_Delay(400U);
-  MotorHw_StopPwm(); // 对齐结束后关闭通道，不能用0占空比代替。
-  if (!MT6701_GetMechanicalAngleRad(&angle_rad) ||
-      !MotorControl_SetElectricalZeroAngle(angle_rad) ||
-      MotorControl_IsCurrentLoopFaulted())
-  {
-    Error_Handler();
-  }
-
-  /* 零位设置会使旧dq反馈失效；等下一次ADC和TIM3反馈后再启动电流环。 */
-  start_tick = HAL_GetTick();
-	MotorControl_GetCurrentDQ(&id_a, &iq_a);
-
-  if (!MotorHw_StartPwm())
-  {
-    Error_Handler();
-  }
-  if (!MotorControl_EnableCurrentLoop())
-  {
-    MotorHw_StopPwm();
-    Error_Handler();
-  }
-
-  /* 一次性测试：零目标基线 → 小Iq阶跃 → 无论是否故障都停PWM。 */
-  start_tick = HAL_GetTick();
-  while (((uint32_t)(HAL_GetTick() - start_tick) < MOTOR_CURRENT_TEST_BASELINE_MS) &&
-         !MotorControl_IsCurrentLoopFaulted())
-  {
-    Main_PrintVofaIfDue();
-  }
-  if (!MotorControl_IsCurrentLoopFaulted())
-  {
-    (void)MotorControl_SetIqTarget(MOTOR_CURRENT_TEST_IQ_A);
     start_tick = HAL_GetTick();
-    while (((uint32_t)(HAL_GetTick() - start_tick) < MOTOR_CURRENT_TEST_DURATION_MS) &&
+    while (!MotorControl_IsCurrentReady() &&
+           !MotorControl_IsCurrentLoopFaulted() &&
+           (uint32_t)(HAL_GetTick() - start_tick) < 1000U)
+    {
+      Main_PrintVofaIfDue();
+    }
+    if (!MotorControl_IsCurrentReady() || MotorControl_IsCurrentLoopFaulted())
+    {
+      break;
+    }
+
+    // 固定d轴电压对齐；幅值沿用当前0.5，须限流供电且确认转子实际对齐。
+    if (!FocSvpwm_ComputeDuty(0.0f, 0.5f, 0.0f, &duty) || !MotorHw_StartPwm())
+    {
+      break;
+    }
+	  MotorHw_SetPhaseDuty(duty.duty_u, duty.duty_v, duty.duty_w);
+
+    HAL_Delay(400U); // 仅用于上电对齐，不得在ISR中调用。
+
+    if (MotorControl_IsCurrentLoopFaulted() || !MT6701_GetMechanicalAngleRad(&angle_rad))
+    {
+      break;
+    }
+	 MotorHw_StopPwm();
+    (void)MotorControl_SetElectricalZeroAngle(angle_rad);
+
+
+    // 先以零电流目标建立基线，再对Iq施加0.1 A阶跃。
+    (void)MotorControl_SetIqTarget(0.0f);
+    (void)MotorControl_SetIdTarget(0.0f);
+    if (!MotorHw_StartPwm() || !MotorControl_EnableCurrentLoop())
+    {
+      break;
+    }
+
+    start_tick = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start_tick) < 100U &&
            !MotorControl_IsCurrentLoopFaulted())
     {
       Main_PrintVofaIfDue();
     }
-  }
+    if (MotorControl_IsCurrentLoopFaulted())
+    {
+      break;
+    }
+
+    (void)MotorControl_SetIdTarget(0.5f);
+    start_tick = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - start_tick) < 2000U &&
+           !MotorControl_IsCurrentLoopFaulted())
+    {
+      Main_PrintVofaIfDue();
+    }
+  } while (0);
+
   (void)MotorControl_SetIqTarget(0.0f);
+  (void)MotorControl_SetIdTarget(0.0f);
   MotorControl_DisableCurrentLoop();
   MotorHw_StopPwm();
-#endif
-
+  HAL_Delay(20U);
+  Main_PrintVofaIfDue(); // 最后一帧显示停机后的目标、电压和故障；dq可能保留停机前值。
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -218,7 +219,6 @@ int main(void)
 
     /* USER CODE END WHILE */
 
-    Main_PrintVofaIfDue();
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

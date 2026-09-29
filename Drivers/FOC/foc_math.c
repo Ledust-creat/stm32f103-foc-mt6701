@@ -120,8 +120,6 @@ void FOC_InvPark(float Id, float Iq, float *pIalpha, float *pIbeta, float sinVal
 bool FOC_CurrentToDQ(float iu_a, float iv_a, float electrical_angle_rad,
                      float *id_a, float *iq_a)
 {
-    float alpha_a;
-    float beta_a;
     float sin_theta;
     float cos_theta;
 
@@ -130,8 +128,32 @@ bool FOC_CurrentToDQ(float iu_a, float iv_a, float electrical_angle_rad,
         return false;
     }
 
-    FOC_Clarke(iu_a, iv_a, &alpha_a, &beta_a);
     FOC_SinCos(electrical_angle_rad, &sin_theta, &cos_theta);
+    return FOC_CurrentToDQWithSinCos(iu_a, iv_a, sin_theta, cos_theta, id_a, iq_a);
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: FOC_CurrentToDQWithSinCos
+*   功能说明: 复用调用者计算的正余弦，经Clarke/Park获得dq电流，不重复计算三角函数
+*   形    参: iu_a/iv_a - U/V相电流，单位A
+*             sin_theta/cos_theta - 同一电角度的正余弦，须满足sin²+cos²约等于1
+*             id_a/iq_a - 不同的有效输出指针，单位A；所有输入须为有限值
+*   返 回 值: true表示输出有效；false表示指针错误，输出保持不变
+*********************************************************************************************************
+*/
+bool FOC_CurrentToDQWithSinCos(float iu_a, float iv_a, float sin_theta,
+                              float cos_theta, float *id_a, float *iq_a)
+{
+    float alpha_a;
+    float beta_a;
+
+    if ((id_a == NULL) || (iq_a == NULL) || (id_a == iq_a))
+    {
+        return false;
+    }
+
+    FOC_Clarke(iu_a, iv_a, &alpha_a, &beta_a);
     FOC_Park(alpha_a, beta_a, id_a, iq_a, sin_theta, cos_theta);
     return true;
 }
@@ -150,8 +172,7 @@ bool FOC_CurrentToDQ(float iu_a, float iv_a, float electrical_angle_rad,
 bool FocSvpwm_ComputeDuty(float electrical_angle_rad, float ud_norm, float uq_norm,
                           FocPhaseDuty_t *duty_out)
 {
-    float sin_theta, cos_theta, alpha, beta;
-    float u, v, w, max_u, min_u, span, common;
+    float sin_theta, cos_theta;
 
     if (duty_out == NULL)
     {
@@ -159,6 +180,30 @@ bool FocSvpwm_ComputeDuty(float electrical_angle_rad, float ud_norm, float uq_no
     }
 
     FOC_SinCos(electrical_angle_rad, &sin_theta, &cos_theta);
+    return FocSvpwm_ComputeDutyWithSinCos(ud_norm, uq_norm, sin_theta, cos_theta, duty_out);
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: FocSvpwm_ComputeDutyWithSinCos
+*   功能说明: 复用正余弦执行反Park及零序注入SVPWM；电压矢量超限时等比例缩放
+*   形    参: ud_norm/uq_norm - 按母线电压归一化的dq电压
+*             sin_theta/cos_theta - 与电流Park同一电角度的正余弦，须为单位圆上的值
+*             duty_out - 输出三相占空比的有效存储；所有输入须为有限值
+*   返 回 值: true表示输出有效；false表示空指针，输出保持不变
+*********************************************************************************************************
+*/
+bool FocSvpwm_ComputeDutyWithSinCos(float ud_norm, float uq_norm, float sin_theta,
+                                   float cos_theta, FocPhaseDuty_t *duty_out)
+{
+    float alpha, beta;
+    float u, v, w, max_u, min_u, span, common;
+
+    if (duty_out == NULL)
+    {
+        return false;
+    }
+
     FOC_InvPark(ud_norm, uq_norm, &alpha, &beta, sin_theta, cos_theta);
 
     // 逆Clarke的三相相电压加入同一个零序偏置，不改变线电压。

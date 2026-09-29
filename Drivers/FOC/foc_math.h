@@ -57,10 +57,16 @@ void FOC_InvPark(float Id, float Iq, float *pIalpha, float *pIbeta, float sinVal
 /* 两相电流(A)经Clarke、Park转换到dq；输入须为有限值，角度须为已校准电角度(rad)。 */
 bool FOC_CurrentToDQ(float iu_a, float iv_a, float electrical_angle_rad,
                      float *id_a, float *iq_a);
+/* 电流单位A；sin/cos须对应同一电角度，供实时控制复用，不在内部计算三角函数。 */
+bool FOC_CurrentToDQWithSinCos(float iu_a, float iv_a, float sin_theta,
+                              float cos_theta, float *id_a, float *iq_a);
 
 /* dq电压按母线电压归一化；输入须为有限值，输出三相占空比。 */
 bool FocSvpwm_ComputeDuty(float electrical_angle_rad, float ud_norm, float uq_norm,
                           FocPhaseDuty_t *duty_out);
+/* dq电压按母线电压归一化；复用与电流Park相同的sin/cos，输出三相占空比。 */
+bool FocSvpwm_ComputeDutyWithSinCos(float ud_norm, float uq_norm, float sin_theta,
+                                   float cos_theta, FocPhaseDuty_t *duty_out);
 
 /*
 *********************************************************************************************************

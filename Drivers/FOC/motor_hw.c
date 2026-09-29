@@ -60,33 +60,6 @@ static HAL_StatusTypeDef MotorHw_StartEncoderDma(void)
 
     return status;
 }
-
-/*
-*********************************************************************************************************
-*   函 数 名: MotorHw_Init
- *   功能说明: 校准ADC并启动编码器DMA、同步注入采样与两个定时器计数；不启动PWM通道
-*   形    参: 无
-*   返 回 值: true表示全部启动成功；false时调用者须进入安全错误处理
-*********************************************************************************************************
-*/
-bool MotorHw_Init(void)
-{
-
-    /* 此处只启动外设；启动成功后SPI DMA、ADC注入完成和TIM3周期回调自动发生。 */
-    if ((HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK) ||
-        (HAL_ADCEx_Calibration_Start(&hadc2) != HAL_OK) ||
-        (HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK) ||
-        (HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK) ||
-        (MotorHw_StartEncoderDma() != HAL_OK) ||
-        (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) ||
-        (HAL_TIM_Base_Start(&htim1) != HAL_OK))
-    {
-        return false;
-    }
-
-    return true;
-}
-
 /*
 *********************************************************************************************************
 *   函 数 名: MotorHw_StartPwm
@@ -136,6 +109,7 @@ void MotorHw_StopPwm(void)
 
 }
 
+
 /*
 *********************************************************************************************************
 *   函 数 名: MotorHw_SetPhaseDuty
@@ -149,6 +123,32 @@ void MotorHw_SetPhaseDuty(float duty_u, float duty_v, float duty_w)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, MotorHw_DutyToCompare(duty_u));
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, MotorHw_DutyToCompare(duty_v));
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, MotorHw_DutyToCompare(duty_w));
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorHw_Init
+ *   功能说明: 校准ADC并启动编码器DMA、同步注入采样与两个定时器计数；不启动PWM通道
+*   形    参: 无
+*   返 回 值: true表示全部启动成功；false时调用者须进入安全错误处理
+*********************************************************************************************************
+*/
+bool MotorHw_Init(void)
+{
+
+    /* 此处只启动外设；启动成功后SPI DMA、ADC注入完成和TIM3周期回调自动发生。 */
+    if ((HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK) ||
+        (HAL_ADCEx_Calibration_Start(&hadc2) != HAL_OK) ||
+        (HAL_ADCEx_InjectedStart(&hadc2) != HAL_OK) ||
+        (HAL_ADCEx_InjectedStart_IT(&hadc1) != HAL_OK) ||
+        (MotorHw_StartEncoderDma() != HAL_OK) ||
+        (HAL_TIM_Base_Start_IT(&htim3) != HAL_OK) ||
+        (HAL_TIM_Base_Start(&htim1) != HAL_OK))
+    {
+        return false;
+    }
+
+    return true;
 }
 
 /*
@@ -197,9 +197,7 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    const float volt_per_count = (float)ADC_REFERENCE_VOLT /
-        (float)((1UL << ADC_BITS) - 1UL);
-    const float midpoint_v = (float)ADC_REFERENCE_VOLT * 0.5f;
+    const float volt_per_count = (float)ADC_REFERENCE_VOLT / (float)((1UL << ADC_BITS) - 1UL);
     float u_centered_v;
     float v_centered_v;
     FocPhaseDuty_t duty;
@@ -211,13 +209,12 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         return;
     }
 
-    u_centered_v = (float)HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1) *
-                   volt_per_count - midpoint_v;
-    v_centered_v = (float)HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1) *
-                   volt_per_count - midpoint_v;
+    u_centered_v = (float)HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1) * volt_per_count - ADC_REFERENCE_VOLT * 0.5f;
+    v_centered_v = (float)HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1) * volt_per_count - ADC_REFERENCE_VOLT * 0.5f;
     result = MotorControl_OnAdcVoltageISR(u_centered_v, v_centered_v, &duty);
     if (result == MOTOR_CONTROL_ADC_DUTY_READY)
     {
+
         MotorHw_SetPhaseDuty(duty.duty_u, duty.duty_v, duty.duty_w);
     }
     else if (result == MOTOR_CONTROL_ADC_FAULT)
@@ -229,7 +226,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 /*
 *********************************************************************************************************
 *   函 数 名: HAL_TIM_PeriodElapsedCallback
-*   功能说明: TIM3周期事件更新速度；若检测到编码器停更或超速则立即关闭PWM
+*   功能说明: TIM3周期事件仅转交机械速度估算，不参与电流环使能或故障判断
 *********************************************************************************************************
 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
@@ -238,9 +235,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (htim == &htim3)
     {
         MotorControl_OnSpeedTickISR();
-        if (MotorControl_IsCurrentLoopFaulted())
-        {
-            MotorHw_StopPwm();
-        }
+
     }
 }
