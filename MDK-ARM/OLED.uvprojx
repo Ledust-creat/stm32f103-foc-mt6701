@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F103xB,ARM_MATH_CM3</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;./Hardware;../Middlewares/ST/ARM/DSP/Inc;../Drivers/FOC</IncludePath>
+              <IncludePath>../Core/Inc;../App/Communication;../Drivers/STM32F1xx_HAL_Driver/Inc;../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F1xx/Include;../Drivers/CMSIS/Include;./Hardware;../Middlewares/ST/ARM/DSP/Inc;../Drivers/FOC</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1067,6 +1067,21 @@
               <FileName>mt6701.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\Drivers\FOC\mt6701.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>App/Communication</GroupName>
+          <Files>
+            <File>
+              <FileName>motor_tune_link.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Communication\motor_tune_link.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_tune_link.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\App\Communication\motor_tune_link.h</FilePath>
             </File>
           </Files>
         </Group>

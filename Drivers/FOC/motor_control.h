@@ -12,38 +12,39 @@ typedef enum
     MOTOR_CONTROL_ADC_FAULT            /* 故障锁存，硬件层应立即关闭PWM */
 } MotorControlAdcResult_t;
 
-/* 清除软件反馈/校准/PI状态；必须在ADC/TIM3中断启动前调用，不会启动硬件或电流环。 */
-void MotorControl_Init(void);
-/* 256次无电流采样完成时返回true；不代表相序、极性或电角度零位已验证。 */
-bool MotorControl_IsCurrentReady(void);
-/* 保存机械角作为电角度零位；调用者须保证输入有效，闭环前应先做转子对齐。 */
-bool MotorControl_SetElectricalZeroAngle(float mechanical_angle_rad);
-/* 设置d轴电流目标(A)，超出±1.55A时钳位。 */
-bool MotorControl_SetIdTarget(float id_ref_a);
-/* 设置q轴电流目标(A)，超出±1.55A时钳位。 */
-bool MotorControl_SetIqTarget(float iq_ref_a);
-/* PWM启动后显式使能；要求校零完成、零位及编码器角度有效，不依赖速度反馈。 */
-bool MotorControl_EnableCurrentLoop(void);
-/* 禁用电流环并清除PI状态；不清除已锁存的保护故障。 */
-void MotorControl_DisableCurrentLoop(void);
-bool MotorControl_IsCurrentLoopFaulted(void);
+typedef enum
+{
+    MOTOR_CONTROL_MODE_CURRENT = 0, /* 上层直接给Id/Iq目标 */
+    MOTOR_CONTROL_MODE_SPEED,       /* 速度PI给Iq目标，内含电流环 */
+    MOTOR_CONTROL_MODE_POSITION     /* 预留位置→速度→电流串级；当前未实现 */
+} MotorControlMode_t;
 
-/* 由motor_hw的HAL ADC完成回调自动调用；未显式使能时只更新反馈，不输出PWM占空比。 */
+bool MotorControl_Init(MotorControlMode_t mode); /* 选择模式并初始化控制器；不启动外设或PWM。 */
+bool MotorControl_Enable(void);                  /* 使能所选模式；需完成校零、对齐，SPEED还需速度PI就绪。 */
+void MotorControl_Disable(void);                 /* 退出运行并复位PI；硬件PWM由应用层关闭。 */
+bool MotorControl_IsCurrentReady(void);           /* 返回256次电流零偏校准是否完成。 */
+bool MotorControl_SetElectricalZeroAngle(float mechanical_angle_rad); /* 设置对齐零位，输入范围[0,2π)。 */
+bool MotorControl_SetIdTarget(float id_ref_a);    /* 设置d轴电流目标，单位A，范围±1.55A。 */
+bool MotorControl_SetIqTarget(float iq_ref_a);    /* CURRENT模式设置q轴目标，单位A，范围±1.55A。 */
+bool MotorControl_IsFaulted(void);                /* 查询锁存故障；需重新初始化才能清除。 */
+
+bool MotorControl_SetSpeedPid(float kp, float ki_per_s); /* 配置速度PI；仅SPEED模式停机时有效。 */
+bool MotorControl_SetSpeedTargetRadS(float target_rad_s); /* 设置机械速度目标，单位rad/s。 */
+bool MotorControl_GetSpeedTargetRadS(float *target_rad_s); /* 读取机械速度目标，单位rad/s。 */
+
+bool MotorControl_SetPositionTargetRad(float target_rad); /* 保存位置目标，单位rad，范围[-2π,2π)。 */
+bool MotorControl_GetPositionTargetRad(float *target_rad); /* 读取已保存的位置目标，单位rad。 */
+bool MotorControl_GetMechanicalPositionRad(float *position_rad); /* 读取两圈折返机械位置，单位rad。 */
+
 MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
                                                       float v_centered_v,
-                                                      FocPhaseDuty_t *duty_out);
-/* 由motor_hw的TIM3 HAL回调自动调用；依据MT6701新帧更新机械速度。 */
-void MotorControl_OnSpeedTickISR(void);
+                                                      FocPhaseDuty_t *duty_out); /* ADC同步输入V，输出本周期PWM占空比。 */
+bool MotorControl_OnSpeedTickISR(void);           /* TIM3速度更新；返回true表示需由硬件层关闭PWM。 */
 
-/* 读取最新d/q电流，单位A；低频读取时两值可能跨一个ADC周期。 */
-bool MotorControl_GetCurrentDQ(float *id_a, float *iq_a);
-/* 临时串口诊断：读取最新U/V相电流，单位A；低频读取时两值可能跨一个ADC周期。 */
-bool MotorControl_GetPhaseCurrentUV(float *iu_a, float *iv_a);
-/* 读取d/q电流目标，单位A；返回实际保存的限幅后目标。 */
-bool MotorControl_GetCurrentTargets(float *id_ref_a, float *iq_ref_a);
-/* 最近一次q轴归一化电压指令；停机或故障后为0，供VOFA低频观察。 */
-bool MotorControl_GetVoltageQ(float *uq_norm);
-/* 机械速度(rad/s)；编码器停更时返回false且不写输出。 */
-bool MotorControl_GetMechanicalSpeed(float *speed_rad_s);
+bool MotorControl_GetCurrentDQ(float *id_a, float *iq_a); /* 读取d/q电流反馈，单位A。 */
+bool MotorControl_GetPhaseCurrentUV(float *iu_a, float *iv_a); /* 读取U/V相电流，单位A。 */
+bool MotorControl_GetCurrentTargets(float *id_ref_a, float *iq_ref_a); /* 读取d/q电流目标，单位A。 */
+bool MotorControl_GetVoltageQ(float *uq_norm);    /* 读取q轴归一化电压指令；停机时为0。 */
+bool MotorControl_GetMechanicalSpeed(float *speed_rad_s); /* 读取机械速度反馈，单位rad/s。 */
 
 #endif /* MOTOR_CONTROL_H */

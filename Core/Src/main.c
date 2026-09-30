@@ -27,10 +27,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h>
 #include "foc_config.h"
 #include "motor_hw.h"
 #include "motor_control.h"
+#include "motor_tune_link.h"
 #include "mt6701.h"
 /* USER CODE END Includes */
 
@@ -64,37 +64,231 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+typedef enum
+{
+  MAIN_STATE_BOOT = 0, /* 外设启动、校零和转子对齐阶段 */
+  MAIN_STATE_READY,    /* PWM关闭，等待有效控制命令 */
+  MAIN_STATE_RUNNING,  /* 速度阶跃执行中 */
+  MAIN_STATE_STOPPING, /* 速度目标归零，等待转子降至静止 */
+  MAIN_STATE_FAULT     /* 本次启动发生故障，禁止再次启动 */
+} MainState_t;
+
+/* 应用层只管理一次速度试验的运行阶段；电流/速度 PI 状态由MotorControl持有。 */
+static MainState_t s_main_state = MAIN_STATE_BOOT;
+static uint32_t s_trial_start_ms;     /* 本次试验起始tick，单位ms */
+static uint32_t s_trial_duration_ms;  /* 本次试验时长，单位ms */
+static uint32_t s_stop_start_ms;      /* 进入受控停机时的tick，单位ms */
+static uint32_t s_still_start_ms;     /* 连续满足静止条件的起始tick，0表示尚未满足 */
+static uint32_t s_last_data_ms;       /* 上一帧遥测发送tick，单位ms */
+
 /*
 *********************************************************************************************************
-*   函 数 名: Main_PrintVofaIfDue
-*   功能说明: 每20 ms发送Iq目标、U/V相电流、dq反馈、电压、速度及故障；不得在中断中调用
-*   返 回 值: 无；printf由USART2的fputc发送，发送超时由重定向层限制
+*   函 数 名: Main_Stop
+*   功能说明: 统一停止当前控制并关闭PWM，供STOP、故障和试验结束路径复用
+*   返 回 值: 无
 *********************************************************************************************************
 */
-static void Main_PrintVofaIfDue(void)
+static void Main_Stop(void)
 {
-  static uint32_t last_print_tick;
-  float id_ref_a = 0.0f, iq_ref_a = 0.0f;
-  float iu_a = 0.0f, iv_a = 0.0f;
-  float id_a = 0.0f, iq_a = 0.0f, uq_norm = 0.0f;
-  float speed_rad_s = 0.0f;
-  uint32_t now = HAL_GetTick();
+  MotorControl_Disable();
+  MotorHw_StopPwm();
+}
 
-  if ((uint32_t)(now - last_print_tick) < 20U)
+/*
+*********************************************************************************************************
+*   函 数 名: Main_ProcessCommand
+*   功能说明: 执行已解析的串口命令；负责应用状态、限值检查及控制/硬件启停顺序
+*   形    参: command - motor_tune_link解析出的命令，不包含HAL或FOC内部状态
+*   返 回 值: 无；命令被接受时发送OK，不接受的命令不回复
+*********************************************************************************************************
+*/
+static void Main_ProcessCommand(const MotorTuneCommand_t *command)
+{
+  float speed_rad_s;
+
+  if (command->type == MOTOR_TUNE_PING)
+  {
+    MotorTuneLink_SendOk();
+    return;
+  }
+  if (command->type == MOTOR_TUNE_STOP)
+  {
+    Main_Stop();
+    s_main_state = MotorControl_IsFaulted() ? MAIN_STATE_FAULT : MAIN_STATE_READY;
+    MotorTuneLink_SendOk();
+    return;
+  }
+  if (s_main_state != MAIN_STATE_READY || !MOTOR_SPEED_LIMITS_READY) return;
+
+  if (command->type == MOTOR_TUNE_SET_SPEED_PID)
+  {
+    if (MotorControl_SetSpeedPid(command->value_a, command->value_b))
+      MotorTuneLink_SendOk();
+    return;
+  }
+  if (command->type != MOTOR_TUNE_RUN_SPEED_STEP) return;
+  if (!(command->value_a > 0.0f && command->value_a <= MOTOR_SPEED_MAX_RAD_S) ||
+      (command->duration_ms == 0U) ||
+      (command->duration_ms > MOTOR_SPEED_TRIAL_MAX_MS) ||
+      !MotorControl_GetMechanicalSpeed(&speed_rad_s) ||
+      !(speed_rad_s >= -MOTOR_SPEED_STOP_THRESHOLD_RAD_S &&
+        speed_rad_s <= MOTOR_SPEED_STOP_THRESHOLD_RAD_S))
   {
     return;
   }
-  last_print_tick = now;
 
-  (void)MotorControl_GetCurrentTargets(&id_ref_a, &iq_ref_a);
-  (void)MotorControl_GetPhaseCurrentUV(&iu_a, &iv_a);
-  (void)MotorControl_GetCurrentDQ(&id_a, &iq_a);
-  (void)MotorControl_GetVoltageQ(&uq_norm);
-  (void)MotorControl_GetMechanicalSpeed(&speed_rad_s);
-  // FireWater列顺序：Iq目标(A)、U/V相电流(A)、Id/Iq反馈(A)、Uq归一化、速度(rad/s)、故障。
-  printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u\r\n",
-         id_ref_a, iu_a, iv_a, id_a, iq_a, uq_norm, speed_rad_s,
-         (unsigned int)MotorControl_IsCurrentLoopFaulted());
+  if (!MotorControl_SetSpeedTargetRadS(command->value_a) || !MotorHw_StartPwm())
+  {
+    Main_Stop();
+    return;
+  }
+  if (!MotorControl_Enable())
+  {
+    Main_Stop();
+    if (MotorControl_IsFaulted()) s_main_state = MAIN_STATE_FAULT;
+    return;
+  }
+  s_trial_duration_ms = command->duration_ms;
+  s_trial_start_ms = HAL_GetTick();
+  s_last_data_ms = s_trial_start_ms;
+  s_main_state = MAIN_STATE_RUNNING;
+  MotorTuneLink_SendOk();
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: Main_PollCommand
+*   功能说明: 在主循环中取出一条完整串口命令并交给应用状态机
+*   返 回 值: 无
+*********************************************************************************************************
+*/
+static void Main_PollCommand(void)
+{
+  MotorTuneCommand_t command;
+  if (MotorTuneLink_ReadCommand(&command)) Main_ProcessCommand(&command);
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: Main_UpdateTrial
+*   功能说明: 推进限时试验和受控停机状态；超时/故障时统一进入安全停机
+*   返 回 值: 无
+*********************************************************************************************************
+*/
+static void Main_UpdateTrial(void)
+{
+  uint32_t now = HAL_GetTick();
+  float speed_rad_s;
+
+  if (MotorControl_IsFaulted())
+  {
+    Main_Stop();
+    s_main_state = MAIN_STATE_FAULT;
+    return;
+  }
+  if (s_main_state == MAIN_STATE_RUNNING &&
+      (uint32_t)(now - s_trial_start_ms) >= s_trial_duration_ms)
+  {
+    (void)MotorControl_SetSpeedTargetRadS(0.0f);
+    s_stop_start_ms = now;
+    s_still_start_ms = 0U;
+    s_main_state = MAIN_STATE_STOPPING;
+  }
+  if (s_main_state != MAIN_STATE_STOPPING) return;
+
+  if (MotorControl_GetMechanicalSpeed(&speed_rad_s) &&
+      (speed_rad_s >= -MOTOR_SPEED_STOP_THRESHOLD_RAD_S) &&
+      (speed_rad_s <= MOTOR_SPEED_STOP_THRESHOLD_RAD_S))
+  {
+    if (s_still_start_ms == 0U) s_still_start_ms = now;
+    if ((uint32_t)(now - s_still_start_ms) >= 50U)
+    {
+      Main_Stop();
+      s_main_state = MAIN_STATE_READY;
+      return;
+    }
+  }
+  else
+  {
+    s_still_start_ms = 0U;
+  }
+  if ((uint32_t)(now - s_stop_start_ms) >= MOTOR_SPEED_STOP_TIMEOUT_MS)
+  {
+    Main_Stop();
+    s_main_state = MAIN_STATE_FAULT;
+  }
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: Main_SendDataIfDue
+*   功能说明: 试验运行期间每10ms发送速度与Iq遥测；不在任何ISR中格式化或发送
+*   返 回 值: 无
+*********************************************************************************************************
+*/
+static void Main_SendDataIfDue(void)
+{
+  uint32_t now = HAL_GetTick();
+  float speed_ref;
+  float speed;
+  float id_ref;
+  float iq_ref;
+  float id;
+  float iq;
+
+  if ((s_main_state != MAIN_STATE_RUNNING) && (s_main_state != MAIN_STATE_STOPPING)) return;
+  if ((uint32_t)(now - s_last_data_ms) < 10U) return;
+  s_last_data_ms = now;
+  if (!MotorControl_GetMechanicalSpeed(&speed) ||
+      !MotorControl_GetSpeedTargetRadS(&speed_ref) ||
+      !MotorControl_GetCurrentTargets(&id_ref, &iq_ref) ||
+      !MotorControl_GetCurrentDQ(&id, &iq)) return;
+  (void)id_ref;
+  (void)id;
+  MotorTuneLink_SendData(now - s_trial_start_ms, speed_ref, speed, iq_ref, iq);
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: Main_InitMotor
+*   功能说明: 启动采样、等待电流零偏校准并施加一次固定电压对齐
+*   返 回 值: 无；结束时进入READY或FAULT，PWM保持关闭
+*********************************************************************************************************
+*/
+static void Main_InitMotor(void)
+{
+  uint32_t start_ms;
+  float angle_rad;
+  FocPhaseDuty_t duty;
+
+  if (!MotorHw_Init())
+  {
+    s_main_state = MAIN_STATE_FAULT;
+    return;
+  }
+  start_ms = HAL_GetTick();
+  while (!MotorControl_IsCurrentReady() &&
+         !MotorControl_IsFaulted() &&
+         (uint32_t)(HAL_GetTick() - start_ms) < 1000U)
+  {
+  }
+  if (!MotorControl_IsCurrentReady() || MotorControl_IsFaulted() ||
+      !FocSvpwm_ComputeDuty(0.0f, 0.5f, 0.0f, &duty) || !MotorHw_StartPwm())
+  {
+    MotorHw_StopPwm();
+    s_main_state = MAIN_STATE_FAULT;
+    return;
+  }
+  MotorHw_SetPhaseDuty(duty.duty_u, duty.duty_v, duty.duty_w);
+  HAL_Delay(400U); /* 仅上电对齐使用；绝不放入中断。 */
+  MotorHw_StopPwm();
+  if (!MT6701_GetMechanicalAngleRad(&angle_rad) ||
+      !MotorControl_SetElectricalZeroAngle(angle_rad))
+  {
+    s_main_state = MAIN_STATE_FAULT;
+    return;
+  }
+  s_main_state = MAIN_STATE_READY;
 }
 /* USER CODE END 0 */
 
@@ -104,13 +298,6 @@ static void Main_PrintVofaIfDue(void)
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-  float angle_rad = 0.0f;
-  uint32_t start_tick;
-  FocPhaseDuty_t duty;
-  /* USER CODE END 1 */
-
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -138,88 +325,23 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   MT6701_Init();
-  MotorControl_Init(); /* 仅初始化软件状态和PI参数；此调用本身不启动ADC、定时器或闭环。 */
-  /* 成功后SPI DMA、TIM3速度节拍、TIM1触发的ADC采样会由硬件自动持续触发。 */
-  if (!MotorHw_Init())
+  if (!MotorControl_Init(MOTOR_CONTROL_MODE_SPEED) || !MotorTuneLink_Init())
   {
     Error_Handler();
   }
-  // 上电只测试一次；失败、过流或到时都进入同一个停机出口。
-  do
-  {
-    start_tick = HAL_GetTick();
-    while (!MotorControl_IsCurrentReady() &&
-           !MotorControl_IsCurrentLoopFaulted() &&
-           (uint32_t)(HAL_GetTick() - start_tick) < 1000U)
-    {
-      Main_PrintVofaIfDue();
-    }
-    if (!MotorControl_IsCurrentReady() || MotorControl_IsCurrentLoopFaulted())
-    {
-      break;
-    }
-
-    // 固定d轴电压对齐；幅值沿用当前0.5，须限流供电且确认转子实际对齐。
-    if (!FocSvpwm_ComputeDuty(0.0f, 0.5f, 0.0f, &duty) || !MotorHw_StartPwm())
-    {
-      break;
-    }
-	  MotorHw_SetPhaseDuty(duty.duty_u, duty.duty_v, duty.duty_w);
-
-    HAL_Delay(400U); // 仅用于上电对齐，不得在ISR中调用。
-
-    if (MotorControl_IsCurrentLoopFaulted() || !MT6701_GetMechanicalAngleRad(&angle_rad))
-    {
-      break;
-    }
-	 MotorHw_StopPwm();
-    (void)MotorControl_SetElectricalZeroAngle(angle_rad);
-
-
-    // 先以零电流目标建立基线，再对Iq施加0.1 A阶跃。
-    (void)MotorControl_SetIqTarget(0.0f);
-    (void)MotorControl_SetIdTarget(0.0f);
-    if (!MotorHw_StartPwm() || !MotorControl_EnableCurrentLoop())
-    {
-      break;
-    }
-
-    start_tick = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - start_tick) < 100U &&
-           !MotorControl_IsCurrentLoopFaulted())
-    {
-      Main_PrintVofaIfDue();
-    }
-    if (MotorControl_IsCurrentLoopFaulted())
-    {
-      break;
-    }
-
-    (void)MotorControl_SetIdTarget(0.5f);
-    start_tick = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - start_tick) < 2000U &&
-           !MotorControl_IsCurrentLoopFaulted())
-    {
-      Main_PrintVofaIfDue();
-    }
-  } while (0);
-
-  (void)MotorControl_SetIqTarget(0.0f);
-  (void)MotorControl_SetIdTarget(0.0f);
-  MotorControl_DisableCurrentLoop();
-  MotorHw_StopPwm();
-  HAL_Delay(20U);
-  Main_PrintVofaIfDue(); // 最后一帧显示停机后的目标、电压和故障；dq可能保留停机前值。
+  Main_InitMotor(); /* 校零、转子对齐一次，成功后保持PWM关闭并等待命令。 */
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    Main_PollCommand();
+    Main_UpdateTrial();
+    Main_SendDataIfDue();
   }
   /* USER CODE END 3 */
 }

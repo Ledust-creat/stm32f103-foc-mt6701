@@ -52,8 +52,13 @@ static volatile float s_iq_target_a;               /* q轴电流目标，单位A
 static volatile float s_electrical_zero_mechanical_angle_rad; /* 对齐时的机械角零位，单位rad */
 static volatile bool s_electrical_zero_valid;      /* 电角度零位是否已设置 */
 static volatile MotorControlState_t s_current_control_state; /* 电流控制运行状态 */
+static volatile MotorControlMode_t s_control_mode;  /* 初始化时选择的控制模式 */
 static FocPid_t s_id_pi;                           /* d轴电流PI状态 */
 static FocPid_t s_iq_pi;                           /* q轴电流PI状态 */
+static FocPid_t s_speed_pi;                        /* 速度模式下的外环PI状态 */
+static volatile float s_speed_target_rad_s;        /* 机械速度目标，单位rad/s */
+static volatile float s_position_target_rad;       /* 位置目标，单位rad；本轮仅保存 */
+static volatile bool s_speed_pid_ready;            /* SET_SPEED_PID成功后置位 */
 
 /* TIM3速度估算状态。 */
 static volatile float s_speed_rad_s;               /* 滤波后的机械速度，单位rad/s */
@@ -61,6 +66,7 @@ static volatile bool s_speed_valid;                /* 最近速度节拍是否�
 static float s_last_angle_rad;                     /* 上次速度更新时的单圈机械角，单位rad */
 static uint32_t s_last_speed_encoder_frame;        /* 上次用于速度估算的MT6701帧号 */
 static float s_motor_logic_angle_rad;              /* 相对上电首个有效样本的机械逻辑角度，单位rad，范围[-2π, 2π) */
+static uint16_t s_speed_elapsed_ticks;             /* 两个有效编码器帧之间经过的TIM3节拍数 */
 
 
 
@@ -89,8 +95,11 @@ static void MotorControl_ResetCurrentPid(void)
 static MotorControlAdcResult_t MotorControl_LatchFault(void)
 {
     s_current_control_state = MOTOR_CONTROL_STATE_FAULT;
+    s_speed_target_rad_s = 0.0f;
+    s_iq_target_a = 0.0f;
     s_uq_norm = 0.0f;
     MotorControl_ResetCurrentPid();
+    FocPid_Reset(&s_speed_pi);
     return MOTOR_CONTROL_ADC_FAULT;
 }
 
@@ -99,11 +108,15 @@ static MotorControlAdcResult_t MotorControl_LatchFault(void)
 *   函 数 名: MotorControl_SetElectricalZeroAngle
 *   功能说明: 保存转子对齐后的机械角，作为机械角到电角度的零位
 *   形    参: mechanical_angle_rad - 对齐时的单圈机械角，单位rad
-*   返 回 值: true表示零位已保存；调用者须保证输入为有效单圈机械角
+*   返 回 值: true表示[0,2π)内的零位已保存；超出范围时返回false
 *********************************************************************************************************
 */
 bool MotorControl_SetElectricalZeroAngle(float mechanical_angle_rad)
 {
+    if (!(mechanical_angle_rad >= 0.0f && mechanical_angle_rad < MOTOR_CONTROL_TWO_PI_F))
+    {
+        return false;
+    }
     s_electrical_zero_mechanical_angle_rad = mechanical_angle_rad;
     s_electrical_zero_valid = true;
     return true;
@@ -129,13 +142,18 @@ static float MotorControl_ElectricalAngle(float mechanical_angle_rad)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_Init
-*   功能说明: 清零采样/速度状态并初始化d/q电流PI；不启动硬件，也不使能电流环
-*   形    参: 无
-*   返 回 值: 无；初始化失败时电流环保持不可使能
+ *   功能说明: 选择控制模式并初始化反馈状态及所需PI；不启动硬件或闭环
+ *   形    参: mode - CURRENT或SPEED；POSITION待位置PI实现后开放
+ *   返 回 值: true表示初始化成功；不支持的模式或PI初始化失败返回false
 *********************************************************************************************************
 */
-void MotorControl_Init(void)
+bool MotorControl_Init(MotorControlMode_t mode)
 {
+    if ((mode != MOTOR_CONTROL_MODE_CURRENT) &&
+        (mode != MOTOR_CONTROL_MODE_SPEED))
+    {
+        return false; /* 位置模式待位置PI实现后开放。 */
+    }
     s_u_zero_v = 0.0f;
     s_v_zero_v = 0.0f;
     s_u_zero_sum_v = 0.0f;
@@ -151,11 +169,16 @@ void MotorControl_Init(void)
     s_electrical_zero_mechanical_angle_rad = 0.0f;
     s_electrical_zero_valid = false;
     s_current_control_state = MOTOR_CONTROL_STATE_DISABLED;
+    s_control_mode = mode;
+    s_speed_target_rad_s = 0.0f;
+    s_position_target_rad = 0.0f;
+    s_speed_pid_ready = false;
     s_speed_rad_s = 0.0f;
     s_speed_valid = false;
     s_last_angle_rad = 0.0f;
     s_last_speed_encoder_frame = 0U;
     s_motor_logic_angle_rad = 0.0f;
+    s_speed_elapsed_ticks = 0U;
     if (!FocPid_Init(&s_id_pi, MOTOR_CURRENT_KP, MOTOR_CURRENT_KI_PER_S, 0.0f,
                     MOTOR_CURRENT_LOOP_PERIOD_S, -MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM,
                     MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM) ||
@@ -164,7 +187,9 @@ void MotorControl_Init(void)
                     MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM))
     {
         s_current_control_state = MOTOR_CONTROL_STATE_FAULT;
+        return false;
     }
+    return true;
 }
 
 /*
@@ -183,49 +208,173 @@ bool MotorControl_IsCurrentReady(void)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_SetIdTarget
-*   功能说明: 设置d轴电流目标并按软件电流限值钳位
+*   功能说明: 设置d轴电流目标；超出软件电流范围时拒绝，不静默钳位
 *   形    参: id_ref_a - d轴目标电流，单位A
-*   返 回 值: true表示已保存限幅后的目标；调用者须保证输入为有限值
+*   返 回 值: true表示目标已保存；超出±MOTOR_CURRENT_LIMIT_A时返回false
 *********************************************************************************************************
 */
 bool MotorControl_SetIdTarget(float id_ref_a)
 {
-    s_id_target_a = FOC_ClampF32(id_ref_a, -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A);
+    if (!(id_ref_a >= -MOTOR_CURRENT_LIMIT_A && id_ref_a <= MOTOR_CURRENT_LIMIT_A))
+    {
+        return false;
+    }
+    s_id_target_a = id_ref_a;
     return true;
 }
 
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_SetIqTarget
-*   功能说明: 设置q轴电流目标并按软件电流限值钳位
+*   功能说明: 设置q轴电流目标；超出软件电流范围时拒绝，不静默钳位
 *   形    参: iq_ref_a - q轴目标电流，单位A
-*   返 回 值: true表示已保存限幅后的目标；调用者须保证输入为有限值
+*   返 回 值: true表示目标已保存；模式不允许或超出±MOTOR_CURRENT_LIMIT_A时返回false
 *********************************************************************************************************
 */
 bool MotorControl_SetIqTarget(float iq_ref_a)
 {
-
-    
-    s_iq_target_a = FOC_ClampF32(iq_ref_a, -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A);
+    if (s_control_mode != MOTOR_CONTROL_MODE_CURRENT)
+    {
+        return false; /* SPEED模式的Iq目标始终由速度PI拥有。 */
+    }
+    if (!(iq_ref_a >= -MOTOR_CURRENT_LIMIT_A && iq_ref_a <= MOTOR_CURRENT_LIMIT_A))
+    {
+        return false;
+    }
+    s_iq_target_a = iq_ref_a;
     return true;
 }
 
 /*
 *********************************************************************************************************
-*   函 数 名: MotorControl_EnableCurrentLoop
-*   功能说明: 校零和角度零位有效后打开电流环；ADC中断执行PI/SVPWM，不依赖速度就绪
-*   形    参: 无；调用者须先显式启动MotorHw PWM
-*   返 回 值: true表示电流环已使能；任一前置条件不满足或故障锁存时返回false
+*   函 数 名: MotorControl_SetSpeedPid
+*   功能说明: 在SPEED模式停机时初始化速度PI，PI输出限幅为电流目标±MOTOR_CURRENT_LIMIT_A
+*   形    参: kp - 比例增益；ki_per_s - 连续时间积分增益，Kd固定为0
+*   返 回 值: true表示参数符合板级范围并成功初始化；安全限值未确认时返回false
 *********************************************************************************************************
 */
-bool MotorControl_EnableCurrentLoop(void)
+bool MotorControl_SetSpeedPid(float kp, float ki_per_s)
+{
+    if (!MOTOR_SPEED_LIMITS_READY ||
+        (s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
+        (s_current_control_state != MOTOR_CONTROL_STATE_DISABLED) ||
+        !(kp >= 0.0f && kp <= MOTOR_SPEED_KP_MAX) ||
+        !(ki_per_s >= 0.0f && ki_per_s <= MOTOR_SPEED_KI_PER_S_MAX))
+    {
+        return false;
+    }
+    s_speed_pid_ready = FocPid_Init(&s_speed_pi, kp, ki_per_s, 0.0f,
+                                   MOTOR_SPEED_LOOP_PERIOD_S,
+                                   -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A);
+    return s_speed_pid_ready;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_SetSpeedTargetRadS
+*   功能说明: 设置速度外环目标；目标是机械速度，正值对应当前定义的正转方向
+*   形    参: target_rad_s - 速度目标，单位rad/s，受板级配置范围限制
+*   返 回 值: true表示目标已保存；模式、范围或故障状态不允许时返回false
+*********************************************************************************************************
+*/
+bool MotorControl_SetSpeedTargetRadS(float target_rad_s)
+{
+    if (!MOTOR_SPEED_LIMITS_READY ||
+        (s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
+        !(target_rad_s >= 0.0f && target_rad_s <= MOTOR_SPEED_MAX_RAD_S) ||
+        (s_current_control_state == MOTOR_CONTROL_STATE_FAULT))
+    {
+        return false;
+    }
+    s_speed_target_rad_s = target_rad_s;
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_GetSpeedTargetRadS
+*   功能说明: 读取当前机械速度目标
+*   形    参: target_rad_s - 调用者提供的输出存储，单位rad/s
+*   返 回 值: 输出指针有效时返回true
+*********************************************************************************************************
+*/
+bool MotorControl_GetSpeedTargetRadS(float *target_rad_s)
+{
+    if (target_rad_s == 0) return false;
+    *target_rad_s = s_speed_target_rad_s;
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_SetPositionTargetRad
+*   功能说明: 保存位置环将来使用的目标；本轮尚未实现位置PI，不会影响电流或速度目标
+*   形    参: target_rad - 上电逻辑零点下的机械位置，单位rad，范围[-2π,2π)
+*   返 回 值: true表示目标已保存；范围外输入返回false
+*********************************************************************************************************
+*/
+bool MotorControl_SetPositionTargetRad(float target_rad)
+{
+    if (!(target_rad >= -MOTOR_CONTROL_LOGIC_PERIOD_RAD * 0.5f &&
+          target_rad < MOTOR_CONTROL_LOGIC_PERIOD_RAD * 0.5f))
+    {
+        return false;
+    }
+    s_position_target_rad = target_rad;
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_GetPositionTargetRad
+*   功能说明: 读取已保存的位置环目标；本轮位置目标只存取，不参与控制
+*   形    参: target_rad - 调用者提供的输出存储，单位rad
+*   返 回 值: 输出指针有效时返回true
+*********************************************************************************************************
+*/
+bool MotorControl_GetPositionTargetRad(float *target_rad)
+{
+    if (target_rad == 0) return false;
+    *target_rad = s_position_target_rad;
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_GetMechanicalPositionRad
+*   功能说明: 读取TIM3按新编码器帧累计的机械逻辑位置，按4π周期折返
+*   形    参: position_rad - 调用者提供的输出存储，范围[-2π,2π)
+*   返 回 值: 首个有效编码器帧到达后返回true，否则返回false
+*********************************************************************************************************
+*/
+bool MotorControl_GetMechanicalPositionRad(float *position_rad)
+{
+    if ((position_rad == 0) || (s_last_speed_encoder_frame == 0U)) return false;
+    *position_rad = s_motor_logic_angle_rad;
+    return true;
+}
+
+/*
+*********************************************************************************************************
+*   函 数 名: MotorControl_Enable
+*   功能说明: 使能初始化时选择的控制模式；SPEED模式同时运行速度外环和电流内环
+*   形    参: 无；调用者须先显式启动MotorHw PWM
+*   返 回 值: true表示所选控制模式已使能；前置条件不满足或故障锁存时返回false
+*********************************************************************************************************
+*/
+bool MotorControl_Enable(void)
 {
     float angle_rad;
     uint32_t primask;
 
-    if ((s_current_control_state == MOTOR_CONTROL_STATE_FAULT) ||
+    if ((s_current_control_state != MOTOR_CONTROL_STATE_DISABLED) ||
         !MotorControl_IsCurrentReady() || !s_electrical_zero_valid ||
         !MT6701_GetMechanicalAngleRad(&angle_rad))
+    {
+        return false;
+    }
+    if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
+        (!MOTOR_SPEED_LIMITS_READY || !s_speed_pid_ready || !s_speed_valid))
     {
         return false;
     }
@@ -239,6 +388,8 @@ bool MotorControl_EnableCurrentLoop(void)
         return false;
     }
     MotorControl_ResetCurrentPid();
+    FocPid_Reset(&s_speed_pi);
+    if (s_control_mode == MOTOR_CONTROL_MODE_SPEED) s_iq_target_a = 0.0f;
     s_uq_norm = 0.0f;
     s_current_control_state = MOTOR_CONTROL_STATE_RUNNING;
     __set_PRIMASK(primask);
@@ -247,13 +398,13 @@ bool MotorControl_EnableCurrentLoop(void)
 
 /*
 *********************************************************************************************************
-*   函 数 名: MotorControl_DisableCurrentLoop
-*   功能说明: 禁止后续ADC中断输出占空比并清除PI历史状态
+ *   函 数 名: MotorControl_Disable
+ *   功能说明: 禁止所选控制模式输出并清除PI历史状态；硬件PWM由应用层关闭
 *   形    参: 无
 *   返 回 值: 无；此函数不负责关闭硬件PWM通道
 *********************************************************************************************************
 */
-void MotorControl_DisableCurrentLoop(void)
+void MotorControl_Disable(void)
 {
     uint32_t primask = __get_PRIMASK();
 
@@ -261,21 +412,24 @@ void MotorControl_DisableCurrentLoop(void)
     if (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING)
     {
         s_current_control_state = MOTOR_CONTROL_STATE_DISABLED;
+        s_speed_target_rad_s = 0.0f;
+        s_iq_target_a = 0.0f;
         s_uq_norm = 0.0f;
         MotorControl_ResetCurrentPid();
+        FocPid_Reset(&s_speed_pi);
     }
     __set_PRIMASK(primask);
 }
 
 /*
 *********************************************************************************************************
-*   函 数 名: MotorControl_IsCurrentLoopFaulted
+ *   函 数 名: MotorControl_IsFaulted
 *   功能说明: 查询是否存在锁存的PI初始化、过流或无效控制输入故障
 *   形    参: 无
 *   返 回 值: true表示故障已锁存
 *********************************************************************************************************
 */
-bool MotorControl_IsCurrentLoopFaulted(void)
+bool MotorControl_IsFaulted(void)
 {
     return s_current_control_state == MOTOR_CONTROL_STATE_FAULT;
 }
@@ -335,14 +489,14 @@ MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
     current_w_a = -(current_u_a + current_v_a);
     s_current_u_a = current_u_a;
     s_current_v_a = current_v_a;
-    // 对齐时也检查三相电流；目标限幅不能替代实测过流保护。
+    /* 对齐时也检查三相电流；目标限幅不能替代实测过流保护。 */
     if ((fabsf(current_u_a) > MOTOR_CURRENT_LIMIT_A) ||
         (fabsf(current_v_a) > MOTOR_CURRENT_LIMIT_A) ||
         (fabsf(current_w_a) > MOTOR_CURRENT_LIMIT_A))
     {
         return MotorControl_LatchFault();
     }
-    // 对齐前只更新相电流，不用尚未设置的电角度零位做Park变换。
+    /* 对齐前只更新相电流，不用尚未设置的电角度零位做Park变换。 */
     if (!s_electrical_zero_valid)
     {
         return (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) ?
@@ -353,9 +507,9 @@ MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
         return (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) ?
             MotorControl_LatchFault() : MOTOR_CONTROL_ADC_NO_UPDATE;
     }
-    // 同次采样的两相电流经Clarke/Park变为A单位的dq反馈。
+    /* 同次采样的两相电流经Clarke/Park变为A单位的dq反馈。 */
     electrical_angle_rad = MotorControl_ElectricalAngle(angle_rad);
-    // 本周期只计算一次正余弦；Park与SVPWM反Park复用，不缓存到下一周期。
+    /* 本周期只计算一次正余弦；Park与SVPWM反Park复用，不缓存到下一周期。 */
     FOC_SinCos(electrical_angle_rad, &sin_theta, &cos_theta);
     FOC_CurrentToDQWithSinCos(current_u_a, current_v_a, sin_theta, cos_theta, &id_a, &iq_a);
 
@@ -373,10 +527,10 @@ MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
         return MOTOR_CONTROL_ADC_NO_UPDATE;
     }
 
-    /*电流环控制*/
+    /* 电流环控制。 */
     ud_norm = FocPid_Update(&s_id_pi, s_id_target_a - id_a);
     uq_norm = FocPid_Update(&s_iq_pi, s_iq_target_a - iq_a);
-    /*计算SVPWM*/
+    /* 计算SVPWM。 */
     FocSvpwm_ComputeDutyWithSinCos(ud_norm, uq_norm, sin_theta, cos_theta, duty_out);
     s_uq_norm = uq_norm;
     return MOTOR_CONTROL_ADC_DUTY_READY;
@@ -385,49 +539,74 @@ MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_OnSpeedTickISR
-*   功能说明: 在TIM3节拍独立估算机械速度；无效或重复编码器帧不参与本次估算
+*   功能说明: 在TIM3节拍估算机械速度；SPEED模式运行时同时更新外环Iq目标
 *   形    参: 无
-*   返 回 值: 无；不使能电流环，也不触发控制故障
+ *   返 回 值: true表示编码器停更触发故障，motor_hw应立即关闭PWM
 *********************************************************************************************************
 */
-void MotorControl_OnSpeedTickISR(void)
+bool MotorControl_OnSpeedTickISR(void)
 {
     float angle_rad;
     uint32_t frame_count;
     float delta_rad;
     float speed_raw_rad_s;
+    if (s_speed_elapsed_ticks < UINT16_MAX) s_speed_elapsed_ticks++;
     if (!MT6701_GetSample(&angle_rad, &frame_count))
     {
         s_speed_valid = false;
-        return;
+        if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
+            (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) &&
+            (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS))
+        {
+            (void)MotorControl_LatchFault();
+            return true;
+        }
+        return false;
     }
     /* 初始角度记录 */
     if (s_last_speed_encoder_frame == 0U)
     {
         s_last_angle_rad = angle_rad;
         s_last_speed_encoder_frame = frame_count;
-        return;
+        s_speed_elapsed_ticks = 0U;
+        return false;
     }
 
     if (frame_count == s_last_speed_encoder_frame)
     {
-        s_speed_rad_s = 0.0f;
         s_speed_valid = false;
-        return; // 保留上次有效角度基准，不把重复帧当作新采样。
+        if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
+            (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) &&
+            (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS))
+        {
+            (void)MotorControl_LatchFault();
+            return true;
+        }
+        /* 保留角度基准，重复帧不作为零速度样本。 */
+        return false;
     }
 
     delta_rad = FOC_CyclicDiff(angle_rad, s_last_angle_rad, MOTOR_CONTROL_TWO_PI_F);
-    // 上电首个有效样本为0；单圈角差累加后按4π折返，跨+2π会跳到-2π。
+    /* 上电首个有效样本为0；逻辑角度按4π折返，跨+2π会跳到-2π。 */
     s_motor_logic_angle_rad = FOC_CyclicDiff(
         s_motor_logic_angle_rad + delta_rad, 0.0f, MOTOR_CONTROL_LOGIC_PERIOD_RAD);
-    //计算实时角速度
-    speed_raw_rad_s = delta_rad * (float)motor_speed_calc_freq;
-    /*低通滤波*/
+    /* 按两个新编码器帧之间经过的TIM3节拍数换算速度。 */
+    if (s_speed_elapsed_ticks == 0U) s_speed_elapsed_ticks = 1U;
+    speed_raw_rad_s = delta_rad * MOTOR_SPEED_LOOP_FREQ_HZ / (float)s_speed_elapsed_ticks;
+    /* 低通滤波。 */
     s_speed_rad_s = FocFilter_LowPass(speed_raw_rad_s,
                                       s_speed_rad_s, MOTOR_CONTROL_SPEED_ALPHA);
     s_speed_valid = true;
     s_last_angle_rad = angle_rad;
     s_last_speed_encoder_frame = frame_count;
+    s_speed_elapsed_ticks = 0U;
+
+    if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
+        (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING))
+    {
+        s_iq_target_a = FocPid_Update(&s_speed_pi, s_speed_target_rad_s - s_speed_rad_s);
+    }
+    return false;
 }
 
 /*
@@ -473,7 +652,7 @@ bool MotorControl_GetPhaseCurrentUV(float *iu_a, float *iv_a)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_GetCurrentTargets
-*   功能说明: 读取d/q电流目标，返回设置接口保存的限幅后目标
+*   功能说明: 读取最近保存的d/q电流目标，单位A
 *   形    参: id_ref_a/iq_ref_a - d/q目标输出存储，单位A，须为不同的有效指针
 *   返 回 值: 参数有效时返回true
 *********************************************************************************************************
