@@ -51,6 +51,7 @@ bool MotorTuneLink_ReadCommand(MotorTuneCommand_t *command)
     uint32_t primask;
     float first;
     float second;
+    float third;
     unsigned long duration;
     char extra;
 
@@ -80,16 +81,17 @@ bool MotorTuneLink_ReadCommand(MotorTuneCommand_t *command)
         command->type = MOTOR_TUNE_STOP;
         return true;
     }
-    if (sscanf(line, "SET_SPEED_PID,%f,%f%c", &first, &second, &extra) == 2)
+    if (sscanf(line, "SET_PID,%f,%f,%f%c", &first, &second, &third, &extra) == 3)
     {
-        command->type = MOTOR_TUNE_SET_SPEED_PID;
+        command->type = MOTOR_TUNE_SET_PID;
         command->value_a = first;
         command->value_b = second;
+        command->value_c = third;
         return true;
     }
-    if (sscanf(line, "RUN_SPEED_STEP,%f,%lu%c", &first, &duration, &extra) == 2)
+    if (sscanf(line, "RUN_STEP,%f,%lu%c", &first, &duration, &extra) == 2)
     {
-        command->type = MOTOR_TUNE_RUN_SPEED_STEP;
+        command->type = MOTOR_TUNE_RUN_STEP;
         command->value_a = first;
         command->duration_ms = (uint32_t)duration;
         return true;
@@ -114,21 +116,17 @@ void MotorTuneLink_SendOk(void)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorTuneLink_SendData
-*   功能说明: 发送速度与q轴电流遥测行
+*   功能说明: 发送应用层选定控制量的目标与反馈，串口层不解释单位
 *   形    参: elapsed_ms - 试验经过时间，单位ms
-*             speed_ref_rad_s/speed_rad_s - 机械速度目标/反馈，单位rad/s
-*             iq_ref_a/iq_a - q轴电流目标/反馈，单位A
-*   返 回 值: 无；遥测格式为DATA,elapsed,speed_ref,speed,iq_ref,iq
+*             target/feedback - 同一控制量的目标/反馈，单位由应用层决定
+*   返 回 值: 无；遥测格式为DATA,elapsed,target,feedback
 *********************************************************************************************************
 */
-void MotorTuneLink_SendData(uint32_t elapsed_ms, float speed_ref_rad_s,
-                            float speed_rad_s, float iq_ref_a, float iq_a)
+void MotorTuneLink_SendData(uint32_t elapsed_ms, float target, float feedback)
 {
     char line[96];
-    int length = snprintf(line, sizeof(line), "DATA,%lu,%.3f,%.3f,%.4f,%.4f\r\n",
-                          (unsigned long)elapsed_ms,
-                          (double)speed_ref_rad_s, (double)speed_rad_s,
-                          (double)iq_ref_a, (double)iq_a);
+    int length = snprintf(line, sizeof(line), "DATA,%lu,%.3f,%.3f\r\n",
+                          (unsigned long)elapsed_ms, (double)target, (double)feedback);
     if ((length > 0) && (length < (int)sizeof(line)))
     {
         (void)HAL_UART_Transmit(&huart2, (uint8_t *)line, (uint16_t)length, 20U);

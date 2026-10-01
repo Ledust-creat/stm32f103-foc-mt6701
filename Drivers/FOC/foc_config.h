@@ -13,9 +13,6 @@
 #define MOTOR_CURRENT_LOOP_FREQ_HZ \
     (((float)motor_pwm_freq * 2.0f) / ((float)MOTOR_PWM_REPETITION_COUNTER + 1.0f))
 #define MOTOR_CURRENT_LOOP_PERIOD_S (1.0f / MOTOR_CURRENT_LOOP_FREQ_HZ) /* PI固定周期，单位s */
-#define MOTOR_SPEED_TIMER_COUNTS (1000000U / motor_speed_calc_freq + 1U)
-#define MOTOR_SPEED_LOOP_PERIOD_S ((float)MOTOR_SPEED_TIMER_COUNTS / 1000000.0f)
-#define MOTOR_SPEED_LOOP_FREQ_HZ (1.0f / MOTOR_SPEED_LOOP_PERIOD_S)
 
 #define POLE_PAIRS 7U                      /* 电机极对数；机械角乘此值得到电角度 */
 #define R_SHUNT 0.02f                      /* 相电流采样电阻，单位Ω */
@@ -33,20 +30,12 @@
 /* 每轴限幅1/√6，保证最坏dq矢量幅值≤1/√3；这是电压限幅，不是电流限值。 */
 #define MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM 0.40824829f
 
-/* 实机速度安全范围确认前，速度参数设置和速度阶跃保持关闭。 */
-#define MOTOR_SPEED_LIMITS_CONFIRMED 0U
-#define MOTOR_SPEED_MAX_RAD_S 0.0f
-#define MOTOR_SPEED_KP_MAX 0.0f
-#define MOTOR_SPEED_KI_PER_S_MAX 0.0f
-#define MOTOR_SPEED_TRIAL_MAX_MS 0U
-#define MOTOR_SPEED_STOP_THRESHOLD_RAD_S 0.0f
-#define MOTOR_SPEED_STOP_TIMEOUT_MS 0U
-#define MOTOR_SPEED_STALE_TICKS 5U
-#define MOTOR_SPEED_LIMITS_READY \
-    ((MOTOR_SPEED_LIMITS_CONFIRMED != 0U) && \
-     (MOTOR_SPEED_MAX_RAD_S > MOTOR_SPEED_STOP_THRESHOLD_RAD_S) && \
-     (MOTOR_SPEED_STOP_THRESHOLD_RAD_S > 0.0f) && \
-     (MOTOR_SPEED_KP_MAX > 0.0f) && (MOTOR_SPEED_KI_PER_S_MAX > 0.0f) && \
-     (MOTOR_SPEED_TRIAL_MAX_MS > 0U) && (MOTOR_SPEED_STOP_TIMEOUT_MS >= 50U))
-
+/* 速度阶跃调试参数：仅限制正向目标，不检测实测超速；测试仍须限流供电。 */
+#define MOTOR_SPEED_MAX_RAD_S 80.0f        /* 最大正向机械速度目标，单位rad/s */
+#define MOTOR_SPEED_KP 0.01f               /* 速度PI默认Kp，单位A/(rad/s) */
+#define MOTOR_SPEED_KI_PER_S 0.1f          /* 速度PI默认连续时间Ki，单位A/rad */
+#define MOTOR_SPEED_KP_MAX 0.5f           /* 串口可设Kp上限，单位A/(rad/s) */
+#define MOTOR_SPEED_KI_PER_S_MAX 5.0f     /* 串口可设Ki上限，单位A/rad */
+#define MOTOR_SPEED_TRIAL_MAX_MS 3000U    /* 单次速度阶跃最长时长，单位ms */
+#define MOTOR_SPEED_STALE_TICKS 5U        /* 连续5个TIM3节拍无新编码器帧则运行中停机 */
 #endif

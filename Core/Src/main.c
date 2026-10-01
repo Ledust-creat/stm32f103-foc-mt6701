@@ -69,7 +69,6 @@ typedef enum
   MAIN_STATE_BOOT = 0, /* 外设启动、校零和转子对齐阶段 */
   MAIN_STATE_READY,    /* PWM关闭，等待有效控制命令 */
   MAIN_STATE_RUNNING,  /* 速度阶跃执行中 */
-  MAIN_STATE_STOPPING, /* 速度目标归零，等待转子降至静止 */
   MAIN_STATE_FAULT     /* 本次启动发生故障，禁止再次启动 */
 } MainState_t;
 
@@ -77,8 +76,6 @@ typedef enum
 static MainState_t s_main_state = MAIN_STATE_BOOT;
 static uint32_t s_trial_start_ms;     /* 本次试验起始tick，单位ms */
 static uint32_t s_trial_duration_ms;  /* 本次试验时长，单位ms */
-static uint32_t s_stop_start_ms;      /* 进入受控停机时的tick，单位ms */
-static uint32_t s_still_start_ms;     /* 连续满足静止条件的起始tick，0表示尚未满足 */
 static uint32_t s_last_data_ms;       /* 上一帧遥测发送tick，单位ms */
 
 /*
@@ -104,8 +101,6 @@ static void Main_Stop(void)
 */
 static void Main_ProcessCommand(const MotorTuneCommand_t *command)
 {
-  float speed_rad_s;
-
   if (command->type == MOTOR_TUNE_PING)
   {
     MotorTuneLink_SendOk();
@@ -114,25 +109,26 @@ static void Main_ProcessCommand(const MotorTuneCommand_t *command)
   if (command->type == MOTOR_TUNE_STOP)
   {
     Main_Stop();
-    s_main_state = MotorControl_IsFaulted() ? MAIN_STATE_FAULT : MAIN_STATE_READY;
+    /* STOP不清除上电初始化故障或控制层锁存故障。 */
+    if (MotorControl_IsFaulted()) s_main_state = MAIN_STATE_FAULT;
+    else if (s_main_state != MAIN_STATE_FAULT) s_main_state = MAIN_STATE_READY;
     MotorTuneLink_SendOk();
     return;
   }
-  if (s_main_state != MAIN_STATE_READY || !MOTOR_SPEED_LIMITS_READY) return;
+  if (s_main_state != MAIN_STATE_READY) return;
 
-  if (command->type == MOTOR_TUNE_SET_SPEED_PID)
+  if (command->type == MOTOR_TUNE_SET_PID)
   {
-    if (MotorControl_SetSpeedPid(command->value_a, command->value_b))
+    /* 串口只传增益；本应用选择速度环，不把环路选择交给上位机。 */
+    if (MotorControl_SetPid(MOTOR_CONTROL_PID_SPEED,
+                            command->value_a, command->value_b, command->value_c))
       MotorTuneLink_SendOk();
     return;
   }
-  if (command->type != MOTOR_TUNE_RUN_SPEED_STEP) return;
+  if (command->type != MOTOR_TUNE_RUN_STEP) return;
   if (!(command->value_a > 0.0f && command->value_a <= MOTOR_SPEED_MAX_RAD_S) ||
       (command->duration_ms == 0U) ||
-      (command->duration_ms > MOTOR_SPEED_TRIAL_MAX_MS) ||
-      !MotorControl_GetMechanicalSpeed(&speed_rad_s) ||
-      !(speed_rad_s >= -MOTOR_SPEED_STOP_THRESHOLD_RAD_S &&
-        speed_rad_s <= MOTOR_SPEED_STOP_THRESHOLD_RAD_S))
+      (command->duration_ms > MOTOR_SPEED_TRIAL_MAX_MS))
   {
     return;
   }
@@ -171,81 +167,47 @@ static void Main_PollCommand(void)
 /*
 *********************************************************************************************************
 *   函 数 名: Main_UpdateTrial
-*   功能说明: 推进限时试验和受控停机状态；超时/故障时统一进入安全停机
+*   功能说明: 速度阶跃到时或控制故障时立即禁用控制并关闭PWM
 *   返 回 值: 无
 *********************************************************************************************************
 */
 static void Main_UpdateTrial(void)
 {
   uint32_t now = HAL_GetTick();
-  float speed_rad_s;
-
   if (MotorControl_IsFaulted())
   {
     Main_Stop();
     s_main_state = MAIN_STATE_FAULT;
     return;
   }
-  if (s_main_state == MAIN_STATE_RUNNING &&
-      (uint32_t)(now - s_trial_start_ms) >= s_trial_duration_ms)
+  if ((s_main_state == MAIN_STATE_RUNNING) &&
+      ((uint32_t)(now - s_trial_start_ms) >= s_trial_duration_ms))
   {
-    (void)MotorControl_SetSpeedTargetRadS(0.0f);
-    s_stop_start_ms = now;
-    s_still_start_ms = 0U;
-    s_main_state = MAIN_STATE_STOPPING;
-  }
-  if (s_main_state != MAIN_STATE_STOPPING) return;
-
-  if (MotorControl_GetMechanicalSpeed(&speed_rad_s) &&
-      (speed_rad_s >= -MOTOR_SPEED_STOP_THRESHOLD_RAD_S) &&
-      (speed_rad_s <= MOTOR_SPEED_STOP_THRESHOLD_RAD_S))
-  {
-    if (s_still_start_ms == 0U) s_still_start_ms = now;
-    if ((uint32_t)(now - s_still_start_ms) >= 50U)
-    {
-      Main_Stop();
-      s_main_state = MAIN_STATE_READY;
-      return;
-    }
-  }
-  else
-  {
-    s_still_start_ms = 0U;
-  }
-  if ((uint32_t)(now - s_stop_start_ms) >= MOTOR_SPEED_STOP_TIMEOUT_MS)
-  {
+    /* 到时直接切断驱动，不以目标归零代替停机；转子可能继续惯性滑行。 */
     Main_Stop();
-    s_main_state = MAIN_STATE_FAULT;
+    s_main_state = MAIN_STATE_READY;
   }
 }
 
 /*
 *********************************************************************************************************
 *   函 数 名: Main_SendDataIfDue
-*   功能说明: 试验运行期间每10ms发送速度与Iq遥测；不在任何ISR中格式化或发送
+*   功能说明: 试验运行期间每10ms发送目标与反馈；当前应用选择机械速度
 *   返 回 值: 无
 *********************************************************************************************************
 */
 static void Main_SendDataIfDue(void)
 {
   uint32_t now = HAL_GetTick();
-  float speed_ref;
-  float speed;
-  float id_ref;
-  float iq_ref;
-  float id;
-  float iq;
+  float target;
+  float feedback;
 
-  if ((s_main_state != MAIN_STATE_RUNNING) && (s_main_state != MAIN_STATE_STOPPING)) return;
+  if (s_main_state != MAIN_STATE_RUNNING) return;
   if ((uint32_t)(now - s_last_data_ms) < 10U) return;
   s_last_data_ms = now;
-  if (!MotorControl_GetMechanicalSpeed(&speed) ||
-      !MotorControl_GetSpeedTargetRadS(&speed_ref) ||
-      !MotorControl_GetCurrentTargets(&id_ref, &iq_ref) ||
-      !MotorControl_GetCurrentDQ(&id, &iq)) return;
-  (void)id_ref;
-  (void)id;
-  MotorTuneLink_SendData(now - s_trial_start_ms, speed_ref, speed, iq_ref, iq);
+  if (!MotorControl_GetSpeedTargetRadS(&target) ||
+      !MotorControl_GetMechanicalSpeed(&feedback)) return;
+  MotorTuneLink_SendData(now - s_trial_start_ms, target, feedback);
 }
 
 /*

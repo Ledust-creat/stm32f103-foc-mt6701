@@ -58,11 +58,10 @@ static FocPid_t s_iq_pi;                           /* q轴电流PI状态 */
 static FocPid_t s_speed_pi;                        /* 速度模式下的外环PI状态 */
 static volatile float s_speed_target_rad_s;        /* 机械速度目标，单位rad/s */
 static volatile float s_position_target_rad;       /* 位置目标，单位rad；本轮仅保存 */
-static volatile bool s_speed_pid_ready;            /* SET_SPEED_PID成功后置位 */
 
 /* TIM3速度估算状态。 */
 static volatile float s_speed_rad_s;               /* 滤波后的机械速度，单位rad/s */
-static volatile bool s_speed_valid;                /* 最近速度节拍是否收到新的编码器帧 */
+static volatile bool s_speed_valid;                /* 已取得速度反馈，且连续停更未达到配置阈值 */
 static float s_last_angle_rad;                     /* 上次速度更新时的单圈机械角，单位rad */
 static uint32_t s_last_speed_encoder_frame;        /* 上次用于速度估算的MT6701帧号 */
 static float s_motor_logic_angle_rad;              /* 相对上电首个有效样本的机械逻辑角度，单位rad，范围[-2π, 2π) */
@@ -142,9 +141,9 @@ static float MotorControl_ElectricalAngle(float mechanical_angle_rad)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_Init
- *   功能说明: 选择控制模式并初始化反馈状态及所需PI；不启动硬件或闭环
- *   形    参: mode - CURRENT或SPEED；POSITION待位置PI实现后开放
- *   返 回 值: true表示初始化成功；不支持的模式或PI初始化失败返回false
+*   功能说明: 选择控制模式并初始化反馈状态及所需PI；SPEED模式使用默认速度增益
+*   形    参: mode - CURRENT或SPEED；POSITION待位置PI实现后开放
+*   返 回 值: true表示初始化成功；不支持的模式或PI初始化失败返回false
 *********************************************************************************************************
 */
 bool MotorControl_Init(MotorControlMode_t mode)
@@ -172,19 +171,23 @@ bool MotorControl_Init(MotorControlMode_t mode)
     s_control_mode = mode;
     s_speed_target_rad_s = 0.0f;
     s_position_target_rad = 0.0f;
-    s_speed_pid_ready = false;
     s_speed_rad_s = 0.0f;
     s_speed_valid = false;
     s_last_angle_rad = 0.0f;
     s_last_speed_encoder_frame = 0U;
     s_motor_logic_angle_rad = 0.0f;
     s_speed_elapsed_ticks = 0U;
+    /* 速度PI按TIM3标称930 Hz离散化；实际约929.37 Hz，约0.07%误差。 */
     if (!FocPid_Init(&s_id_pi, MOTOR_CURRENT_KP, MOTOR_CURRENT_KI_PER_S, 0.0f,
                     MOTOR_CURRENT_LOOP_PERIOD_S, -MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM,
                     MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM) ||
         !FocPid_Init(&s_iq_pi, MOTOR_CURRENT_KP, MOTOR_CURRENT_KI_PER_S, 0.0f,
                     MOTOR_CURRENT_LOOP_PERIOD_S, -MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM,
-                    MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM))
+                    MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM) ||
+        ((mode == MOTOR_CONTROL_MODE_SPEED) &&
+         !FocPid_Init(&s_speed_pi, MOTOR_SPEED_KP, MOTOR_SPEED_KI_PER_S, 0.0f,
+                      1.0f / (float)motor_speed_calc_freq,
+                      -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A)))
     {
         s_current_control_state = MOTOR_CONTROL_STATE_FAULT;
         return false;
@@ -247,26 +250,50 @@ bool MotorControl_SetIqTarget(float iq_ref_a)
 
 /*
 *********************************************************************************************************
-*   函 数 名: MotorControl_SetSpeedPid
-*   功能说明: 在SPEED模式停机时初始化速度PI，PI输出限幅为电流目标±MOTOR_CURRENT_LIMIT_A
-*   形    参: kp - 比例增益；ki_per_s - 连续时间积分增益，Kd固定为0
-*   返 回 值: true表示参数符合板级范围并成功初始化；安全限值未确认时返回false
+*   函 数 名: MotorControl_SetPid
+*   功能说明: 停机时按环路选择PI并重置其历史状态；不改变控制模式
+*   形    参: loop - d/q电流环或速度环，位置环尚未实现
+*             kp/ki_per_s/kd_s - 连续时间PID参数；本轮Kd须为0
+*   返 回 值: true表示指定PI已更新；状态、环路或参数不符时返回false
 *********************************************************************************************************
 */
-bool MotorControl_SetSpeedPid(float kp, float ki_per_s)
+bool MotorControl_SetPid(MotorControlPidLoop_t loop, float kp, float ki_per_s,
+                         float kd_s)
 {
-    if (!MOTOR_SPEED_LIMITS_READY ||
-        (s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
-        (s_current_control_state != MOTOR_CONTROL_STATE_DISABLED) ||
-        !(kp >= 0.0f && kp <= MOTOR_SPEED_KP_MAX) ||
-        !(ki_per_s >= 0.0f && ki_per_s <= MOTOR_SPEED_KI_PER_S_MAX))
+    if ((s_current_control_state != MOTOR_CONTROL_STATE_DISABLED) || (kd_s != 0.0f))
     {
         return false;
     }
-    s_speed_pid_ready = FocPid_Init(&s_speed_pi, kp, ki_per_s, 0.0f,
-                                   MOTOR_SPEED_LOOP_PERIOD_S,
-                                   -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A);
-    return s_speed_pid_ready;
+
+    if ((loop == MOTOR_CONTROL_PID_ID) || (loop == MOTOR_CONTROL_PID_IQ))
+    {
+        /* 电流环使用ADC周期；上限取当前已使用的d/q默认增益。 */
+        if (!(kp >= 0.0f && kp <= MOTOR_CURRENT_KP) ||
+            !(ki_per_s >= 0.0f && ki_per_s <= MOTOR_CURRENT_KI_PER_S))
+        {
+            return false;
+        }
+        return FocPid_Init((loop == MOTOR_CONTROL_PID_ID) ? &s_id_pi : &s_iq_pi,
+                           kp, ki_per_s, kd_s, MOTOR_CURRENT_LOOP_PERIOD_S,
+                           -MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM,
+                           MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM);
+    }
+
+    if (loop == MOTOR_CONTROL_PID_SPEED)
+    {
+        /* 速度PI仅在SPEED模式存在，按TIM3标称频率离散化。 */
+        if ((s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
+            !(kp >= 0.0f && kp <= MOTOR_SPEED_KP_MAX) ||
+            !(ki_per_s >= 0.0f && ki_per_s <= MOTOR_SPEED_KI_PER_S_MAX))
+        {
+            return false;
+        }
+        return FocPid_Init(&s_speed_pi, kp, ki_per_s, kd_s,
+                           1.0f / (float)motor_speed_calc_freq,
+                           -MOTOR_CURRENT_LIMIT_A, MOTOR_CURRENT_LIMIT_A);
+    }
+
+    return false; /* POSITION等尚无对应PI实例。 */
 }
 
 /*
@@ -279,8 +306,7 @@ bool MotorControl_SetSpeedPid(float kp, float ki_per_s)
 */
 bool MotorControl_SetSpeedTargetRadS(float target_rad_s)
 {
-    if (!MOTOR_SPEED_LIMITS_READY ||
-        (s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
+    if ((s_control_mode != MOTOR_CONTROL_MODE_SPEED) ||
         !(target_rad_s >= 0.0f && target_rad_s <= MOTOR_SPEED_MAX_RAD_S) ||
         (s_current_control_state == MOTOR_CONTROL_STATE_FAULT))
     {
@@ -373,8 +399,7 @@ bool MotorControl_Enable(void)
     {
         return false;
     }
-    if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
-        (!MOTOR_SPEED_LIMITS_READY || !s_speed_pid_ready || !s_speed_valid))
+    if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) && !s_speed_valid)
     {
         return false;
     }
@@ -553,7 +578,7 @@ bool MotorControl_OnSpeedTickISR(void)
     if (s_speed_elapsed_ticks < UINT16_MAX) s_speed_elapsed_ticks++;
     if (!MT6701_GetSample(&angle_rad, &frame_count))
     {
-        s_speed_valid = false;
+        if (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS) s_speed_valid = false;
         if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
             (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) &&
             (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS))
@@ -574,7 +599,7 @@ bool MotorControl_OnSpeedTickISR(void)
 
     if (frame_count == s_last_speed_encoder_frame)
     {
-        s_speed_valid = false;
+        if (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS) s_speed_valid = false;
         if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) &&
             (s_current_control_state == MOTOR_CONTROL_STATE_RUNNING) &&
             (s_speed_elapsed_ticks >= MOTOR_SPEED_STALE_TICKS))
@@ -590,9 +615,9 @@ bool MotorControl_OnSpeedTickISR(void)
     /* 上电首个有效样本为0；逻辑角度按4π折返，跨+2π会跳到-2π。 */
     s_motor_logic_angle_rad = FOC_CyclicDiff(
         s_motor_logic_angle_rad + delta_rad, 0.0f, MOTOR_CONTROL_LOGIC_PERIOD_RAD);
-    /* 按两个新编码器帧之间经过的TIM3节拍数换算速度。 */
+    /* 按两个新编码器帧之间经过的TIM3节拍数换算；使用标称930 Hz，约0.07%误差。 */
     if (s_speed_elapsed_ticks == 0U) s_speed_elapsed_ticks = 1U;
-    speed_raw_rad_s = delta_rad * MOTOR_SPEED_LOOP_FREQ_HZ / (float)s_speed_elapsed_ticks;
+    speed_raw_rad_s = delta_rad * (float)motor_speed_calc_freq / (float)s_speed_elapsed_ticks;
     /* 低通滤波。 */
     s_speed_rad_s = FocFilter_LowPass(speed_raw_rad_s,
                                       s_speed_rad_s, MOTOR_CONTROL_SPEED_ALPHA);

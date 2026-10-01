@@ -58,7 +58,6 @@ void MT6701_OnSpiFrameISR(const uint8_t frame[3])
     {
         return;
     }
-    // crc校验，不通过则放弃本次角度数据
     uint8_t crc_raw = frame[2] & ((1 << 6) - 1);
     uint32_t crc_data = (frame[0] << 16 | frame[1] << 8 | frame[2]) >> 6;
     if (calculate_crc(crc_data) != crc_raw)
@@ -94,7 +93,7 @@ bool MT6701_GetMechanicalAngleRad(float *angle_rad)
 /*
 *********************************************************************************************************
 *   函 数 名: MT6701_GetSample
-*   功能说明: 复制最新单圈角度和帧序号；在同优先级TIM3 ISR中调用
+*   功能说明: 复制最新单圈角度和帧序号；
 *********************************************************************************************************
 */
 bool MT6701_GetSample(float *angle_rad, uint32_t *frame_count)

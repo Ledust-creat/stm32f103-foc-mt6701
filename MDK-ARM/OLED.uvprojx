@@ -1039,6 +1039,16 @@
               <FilePath>..\Drivers\FOC\motor_control.h</FilePath>
             </File>
             <File>
+              <FileName>motor_tune_link.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\App\Communication\motor_tune_link.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_tune_link.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\App\Communication\motor_tune_link.h</FilePath>
+            </File>
+            <File>
               <FileName>foc_pid.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Drivers\FOC\foc_pid.c</FilePath>
@@ -1071,21 +1081,6 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>App/Communication</GroupName>
-          <Files>
-            <File>
-              <FileName>motor_tune_link.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\App\Communication\motor_tune_link.c</FilePath>
-            </File>
-            <File>
-              <FileName>motor_tune_link.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\App\Communication\motor_tune_link.h</FilePath>
-            </File>
-          </Files>
-        </Group>
-        <Group>
           <GroupName>Hardware</GroupName>
           <Files>
             <File>
@@ -1104,9 +1099,6 @@
               <FilePath>.\Hardware\OLED_Font.h</FilePath>
             </File>
           </Files>
-        </Group>
-        <Group>
-          <GroupName>::CMSIS</GroupName>
         </Group>
         <Group>
           <GroupName>Middlewares/Library/DSP Library/DSP Library</GroupName>
@@ -1205,6 +1197,9 @@
               </FileOption>
             </File>
           </Files>
+        </Group>
+        <Group>
+          <GroupName>::CMSIS</GroupName>
         </Group>
       </Groups>
     </Target>
