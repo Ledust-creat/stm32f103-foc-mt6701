@@ -30,12 +30,18 @@
 /* 每轴限幅1/√6，保证最坏dq矢量幅值≤1/√3；这是电压限幅，不是电流限值。 */
 #define MOTOR_DQ_VOLTAGE_AXIS_LIMIT_NORM 0.40824829f
 
-/* 速度阶跃调试参数：仅限制正向目标，不检测实测超速；测试仍须限流供电。 */
-#define MOTOR_SPEED_MAX_RAD_S 80.0f        /* 最大正向机械速度目标，单位rad/s */
-#define MOTOR_SPEED_KP 0.01f               /* 速度PI默认Kp，单位A/(rad/s) */
-#define MOTOR_SPEED_KI_PER_S 0.1f          /* 速度PI默认连续时间Ki，单位A/rad */
+/* 速度目标及位置PI输出限幅；位置模式允许正、反向，测试仍须限流供电。 */
+#define MOTOR_SPEED_MAX_RAD_S 140.0f        /* 机械速度目标幅值上限，单位rad/s */
+#define MOTOR_SPEED_KP 0.04538f             /* 位置调参期间固定的速度PI Kp，单位A/(rad/s) */
+#define MOTOR_SPEED_KI_PER_S 0.54213f       /* 位置调参期间固定的速度PI Ki，单位A/rad；Kd=0 */
 #define MOTOR_SPEED_KP_MAX 0.5f           /* 串口可设Kp上限，单位A/(rad/s) */
 #define MOTOR_SPEED_KI_PER_S_MAX 5.0f     /* 串口可设Ki上限，单位A/rad */
-#define MOTOR_SPEED_TRIAL_MAX_MS 3000U    /* 单次速度阶跃最长时长，单位ms */
+#define MOTOR_SPEED_TRIAL_MAX_MS 5000U    /* 串口单次阶跃最长时长，单位ms；速度/位置试验共用 */
 #define MOTOR_SPEED_STALE_TICKS 5U        /* 连续5个TIM3节拍无新编码器帧则运行中停机 */
+
+/* 位置模式PI默认增益；位置误差(rad)经PI生成机械速度目标(rad/s)。 */
+#define MOTOR_POSITION_KP 0.0f            /* 默认比例增益，单位s^-1 */
+#define MOTOR_POSITION_KI_PER_S 0.0f      /* 默认积分增益，单位s^-2 */
+#define MOTOR_POSITION_KP_MAX 1.0f        /* 配置上限，单位s^-1 */
+#define MOTOR_POSITION_KI_PER_S_MAX 1.0f  /* 配置上限，单位s^-2 */
 #endif

@@ -68,11 +68,11 @@ typedef enum
 {
   MAIN_STATE_BOOT = 0, /* 外设启动、校零和转子对齐阶段 */
   MAIN_STATE_READY,    /* PWM关闭，等待有效控制命令 */
-  MAIN_STATE_RUNNING,  /* 速度阶跃执行中 */
+  MAIN_STATE_RUNNING,  /* 位置阶跃执行中 */
   MAIN_STATE_FAULT     /* 本次启动发生故障，禁止再次启动 */
 } MainState_t;
 
-/* 应用层只管理一次速度试验的运行阶段；电流/速度 PI 状态由MotorControl持有。 */
+/* 应用层管理位置调参试验；位置/速度/电流PI状态由MotorControl持有。 */
 static MainState_t s_main_state = MAIN_STATE_BOOT;
 static uint32_t s_trial_start_ms;     /* 本次试验起始tick，单位ms */
 static uint32_t s_trial_duration_ms;  /* 本次试验时长，单位ms */
@@ -95,7 +95,7 @@ static void Main_Stop(void)
 *********************************************************************************************************
 *   函 数 名: Main_ProcessCommand
 *   功能说明: 执行已解析的串口命令；负责应用状态、限值检查及控制/硬件启停顺序
-*   形    参: command - motor_tune_link解析出的命令，不包含HAL或FOC内部状态
+*   形    参: command - 已解析的命令；RUN_STEP目标单位为度，PID增益沿用内部rad单位
 *   返 回 值: 无；命令被接受时发送OK，不接受的命令不回复
 *********************************************************************************************************
 */
@@ -119,26 +119,29 @@ static void Main_ProcessCommand(const MotorTuneCommand_t *command)
 
   if (command->type == MOTOR_TUNE_SET_PID)
   {
-    /* 串口只传增益；本应用选择速度环，不把环路选择交给上位机。 */
-    if (MotorControl_SetPid(MOTOR_CONTROL_PID_SPEED,
+    /* 串口调节位置PI；速度及电流内环使用已固定的配置参数。 */
+    if (MotorControl_SetPid(MOTOR_CONTROL_PID_POSITION,
                             command->value_a, command->value_b, command->value_c))
       MotorTuneLink_SendOk();
     return;
   }
   if (command->type != MOTOR_TUNE_RUN_STEP) return;
-  if (!(command->value_a > 0.0f && command->value_a <= MOTOR_SPEED_MAX_RAD_S) ||
+  /* 串口位置使用度数[-360,360)，提交控制层时换算为rad。 */
+  if (!(command->value_a >= -360.0f && command->value_a < 360.0f) ||
       (command->duration_ms == 0U) ||
       (command->duration_ms > MOTOR_SPEED_TRIAL_MAX_MS))
   {
     return;
   }
 
-  if (!MotorControl_SetSpeedTargetRadS(command->value_a) || !MotorHw_StartPwm())
+  if (!MotorHw_StartPwm())
   {
     Main_Stop();
     return;
   }
-  if (!MotorControl_Enable())
+  /* Enable先以当前位置作为保持目标；随后提交串口位置目标，避免阶跃被覆盖。 */
+  if (!MotorControl_Enable() ||
+      !MotorControl_SetPositionTargetRad(FOC_DegToRad(command->value_a)))
   {
     Main_Stop();
     if (MotorControl_IsFaulted()) s_main_state = MAIN_STATE_FAULT;
@@ -167,7 +170,7 @@ static void Main_PollCommand(void)
 /*
 *********************************************************************************************************
 *   函 数 名: Main_UpdateTrial
-*   功能说明: 速度阶跃到时或控制故障时立即禁用控制并关闭PWM
+*   功能说明: 位置阶跃到时或控制故障时立即禁用控制并关闭PWM
 *   返 回 值: 无
 *********************************************************************************************************
 */
@@ -192,22 +195,23 @@ static void Main_UpdateTrial(void)
 /*
 *********************************************************************************************************
 *   函 数 名: Main_SendDataIfDue
-*   功能说明: 试验运行期间每10ms发送目标与反馈；当前应用选择机械速度
+*   功能说明: 位置试验期间每10ms发送机械位置目标与反馈，串口单位为度
 *   返 回 值: 无
 *********************************************************************************************************
 */
 static void Main_SendDataIfDue(void)
 {
   uint32_t now = HAL_GetTick();
-  float target;
-  float feedback;
+  float target_rad;
+  float feedback_rad;
 
   if (s_main_state != MAIN_STATE_RUNNING) return;
   if ((uint32_t)(now - s_last_data_ms) < 10U) return;
   s_last_data_ms = now;
-  if (!MotorControl_GetSpeedTargetRadS(&target) ||
-      !MotorControl_GetMechanicalSpeed(&feedback)) return;
-  MotorTuneLink_SendData(now - s_trial_start_ms, target, feedback);
+  if (!MotorControl_GetPositionTargetRad(&target_rad) ||
+      !MotorControl_GetMechanicalPositionRad(&feedback_rad)) return;
+  MotorTuneLink_SendData(now - s_trial_start_ms,
+                         FOC_RadToDeg(target_rad), FOC_RadToDeg(feedback_rad));
 }
 
 /*
@@ -287,7 +291,7 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
   MT6701_Init();
-  if (!MotorControl_Init(MOTOR_CONTROL_MODE_SPEED) || !MotorTuneLink_Init())
+  if (!MotorControl_Init(MOTOR_CONTROL_MODE_POSITION) || !MotorTuneLink_Init())
   {
     Error_Handler();
   }
