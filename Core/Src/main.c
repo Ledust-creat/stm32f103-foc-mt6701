@@ -126,8 +126,8 @@ static void Main_ProcessCommand(const MotorTuneCommand_t *command)
     return;
   }
   if (command->type != MOTOR_TUNE_RUN_STEP) return;
-  /* 串口位置使用度数[-360,360)，提交控制层时换算为rad。 */
-  if (!(command->value_a >= -360.0f && command->value_a < 360.0f) ||
+  /* 串口目标范围为[-360,360]度；反馈连续累计，提交控制层时换算为rad。 */
+  if (!(command->value_a >= -360.0f && command->value_a <= 360.0f) ||
       (command->duration_ms == 0U) ||
       (command->duration_ms > MOTOR_SPEED_TRIAL_MAX_MS))
   {

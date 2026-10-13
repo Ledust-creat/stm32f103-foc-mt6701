@@ -41,9 +41,9 @@ bool MotorControl_SetPid(MotorControlPidLoop_t loop, float kp, float ki_per_s,
 bool MotorControl_SetSpeedTargetRadS(float target_rad_s); /* SPEED模式设置机械速度目标，单位rad/s。 */
 bool MotorControl_GetSpeedTargetRadS(float *target_rad_s); /* 读取速度目标或位置PI生成的速度目标，单位rad/s。 */
 
-bool MotorControl_SetPositionTargetRad(float target_rad); /* 设置POSITION目标，单位rad，范围[-2π,2π)。 */
+bool MotorControl_SetPositionTargetRad(float target_rad); /* 设置POSITION目标，单位rad，范围[-2π,2π]。 */
 bool MotorControl_GetPositionTargetRad(float *target_rad); /* 读取位置目标，单位rad。 */
-bool MotorControl_GetMechanicalPositionRad(float *position_rad); /* 读取两圈折返机械位置，单位rad。 */
+bool MotorControl_GetMechanicalPositionRad(float *position_rad); /* 读取连续累计机械逻辑位置，单位rad，不折返或钳位。 */
 
 MotorControlAdcResult_t MotorControl_OnAdcVoltageISR(float u_centered_v,
                                                       float v_centered_v,

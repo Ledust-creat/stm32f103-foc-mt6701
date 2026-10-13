@@ -71,7 +71,7 @@ void FocPid_Reset(FocPid_t *pid)
 /*
 *********************************************************************************************************
 *   函 数 名: FocPid_Update
-*   功能说明: 计算并限幅PID输出，同时将CMSIS积分状态限制在输出范围
+*   功能说明: 纯P直接按当前误差输出；PI/PID沿用CMSIS递推并回写限幅后的输出
 *   形    参: pid   - 已初始化的PID实例
 *             error - 本控制周期误差，推荐为目标值减反馈值
 *             error必须为有限值
@@ -85,6 +85,12 @@ float FocPid_Update(FocPid_t *pid, float error)
     if (pid == NULL)
     {
         return 0.0f;
+    }
+
+    /* 纯P不依赖历史输出；直接限幅，避免大阶跃饱和后产生残留位置偏差。 */
+    if ((pid->cmsis.Ki == 0.0f) && (pid->cmsis.Kd == 0.0f))
+    {
+        return FocPid_Clamp(pid->cmsis.Kp * error, pid->output_min, pid->output_max);
     }
 
     output = arm_pid_f32(&pid->cmsis, error);

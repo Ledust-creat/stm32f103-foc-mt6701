@@ -17,7 +17,6 @@
 
 #define MOTOR_CONTROL_ZERO_SAMPLES        (256U)                 /* 电流零偏平均采样帧数 */
 #define MOTOR_CONTROL_TWO_PI_F            (2.0f * FOC_PI_F)      /* 单圈机械角周期，rad */
-#define MOTOR_CONTROL_LOGIC_PERIOD_RAD    (4.0f * FOC_PI_F)      /* 逻辑角度两圈周期，折返范围[-2π, 2π) */
 #define MOTOR_CONTROL_SPEED_ALPHA         (0.1f)                 /* 速度低通滤波输入权重 */
 #define MOTOR_CONTROL_CURRENT_ALPHA       (0.3f)                 /* dq电流低通滤波输入权重 */
 
@@ -65,7 +64,7 @@ static volatile float s_speed_rad_s;               /* 滤波后的机械速度�
 static volatile bool s_speed_valid;                /* 已取得速度反馈，且连续停更未达到配置阈值 */
 static float s_last_angle_rad;                     /* 上次速度更新时的单圈机械角，单位rad */
 static volatile uint32_t s_last_speed_encoder_frame; /* 上次用于速度估算的MT6701帧号；主循环用于判断位置反馈有效 */
-static volatile float s_motor_logic_angle_rad;     /* 相对上电首个有效样本的机械逻辑角度，单位rad，范围[-2π, 2π) */
+static volatile float s_motor_logic_angle_rad;     /* 相对上电首个有效样本的连续机械位置，单位rad，不折返或钳位 */
 static uint16_t s_speed_elapsed_ticks;             /* 两个有效编码器帧之间经过的TIM3节拍数 */
 
 
@@ -355,14 +354,14 @@ bool MotorControl_GetSpeedTargetRadS(float *target_rad_s)
 *********************************************************************************************************
 *   函 数 名: MotorControl_SetPositionTargetRad
 *   功能说明: 设置POSITION模式的位置目标；运行中更新目标可触发位置到速度串级响应
-*   形    参: target_rad - 上电逻辑零点下的机械位置，单位rad，范围[-2π,2π)
+*   形    参: target_rad - 上电逻辑零点下的机械位置，单位rad，范围[-2π,2π]
 *   返 回 值: true表示目标已保存；范围外输入返回false
 *********************************************************************************************************
 */
 bool MotorControl_SetPositionTargetRad(float target_rad)
 {
-    if (!(target_rad >= -MOTOR_CONTROL_LOGIC_PERIOD_RAD * 0.5f &&
-          target_rad < MOTOR_CONTROL_LOGIC_PERIOD_RAD * 0.5f))
+    if (!(target_rad >= -MOTOR_CONTROL_TWO_PI_F &&
+          target_rad <= MOTOR_CONTROL_TWO_PI_F))
     {
         return false;
     }
@@ -388,8 +387,8 @@ bool MotorControl_GetPositionTargetRad(float *target_rad)
 /*
 *********************************************************************************************************
 *   函 数 名: MotorControl_GetMechanicalPositionRad
-*   功能说明: 读取TIM3按新编码器帧累计的机械逻辑位置，按4π周期折返
-*   形    参: position_rad - 调用者提供的输出存储，范围[-2π,2π)
+*   功能说明: 读取TIM3按新编码器帧连续累计的机械逻辑位置，不进行周期折返
+*   形    参: position_rad - 调用者提供的输出存储，单位rad，可反映目标范围外的实际位置
 *   返 回 值: 首个有效编码器帧到达后返回true，否则返回false
 *********************************************************************************************************
 */
@@ -628,8 +627,8 @@ bool MotorControl_OnSpeedTickISR(void)
         else if (frame_count != s_last_speed_encoder_frame)
         {
             delta_rad = FOC_CyclicDiff(angle_rad, s_last_angle_rad, MOTOR_CONTROL_TWO_PI_F);
-            /* 逻辑位置以上电首个角度为零，并按4π折返到[-2π,2π)。 */
-            s_motor_logic_angle_rad = FOC_CyclicDiff(s_motor_logic_angle_rad + delta_rad, 0.0f, MOTOR_CONTROL_LOGIC_PERIOD_RAD);
+            /* 首个角度为逻辑零点；连续累计真实位移，目标范围限制不钳住反馈。 */
+            s_motor_logic_angle_rad += delta_rad;
             /* 仅新编码器帧更新速度；重复帧不被误当成零速样本。 */
             if (s_speed_elapsed_ticks == 0U) s_speed_elapsed_ticks = 1U;
             speed_raw_rad_s = delta_rad * (float)motor_speed_calc_freq /
@@ -659,8 +658,8 @@ bool MotorControl_OnSpeedTickISR(void)
     {
         if (s_control_mode == MOTOR_CONTROL_MODE_POSITION)
         {
-            float position_error_rad = FOC_CyclicDiff(
-                s_position_target_rad, s_motor_logic_angle_rad, MOTOR_CONTROL_LOGIC_PERIOD_RAD);
+            /* 按绝对逻辑位置求差，正负目标之间经过零点往返，不跨边界选近路。 */
+            float position_error_rad = s_position_target_rad - s_motor_logic_angle_rad;
             s_speed_target_rad_s = FocPid_Update(&s_position_pi, position_error_rad);
         }
         if ((s_control_mode == MOTOR_CONTROL_MODE_SPEED) ||
