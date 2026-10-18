@@ -1,6 +1,6 @@
-# FOC 可移植内核（第一阶段）
+# FOC 可移植接口草稿（尚未接入）
 
-本目录不依赖 STM32 HAL，目标是让坐标变换和后续控制器能在 STM32、TI、NXP 或主机单元测试中复用。
+本目录保存早期平台接口设计，当前只有 `foc_port.h` 契约，尚未接入实际控制路径。Keil 工程实际使用 `Drivers/FOC/` 中的数学变换、SVPWM、PID、控制和硬件适配；不能将此目录视为已经完成的跨平台内核。
 
 ```text
 ADC/编码器/PWM BSP  <->  foc_port.h  <->  FOC 算法核  <->  APP 模式与目标
@@ -10,7 +10,6 @@ ADC/编码器/PWM BSP  <->  foc_port.h  <->  FOC 算法核  <->  APP 模式与�
 
 | 文件 | 职责 | 不允许依赖 |
 | --- | --- | --- |
-| `foc_math.*` | Clarke、Park 及其逆变换 | HAL、定时器、全局电机状态 |
 | `foc_port.h` | 电流、角度、PWM 的最小平台契约 | 具体 MCU/HAL |
 
 ## 坐标约定
@@ -19,4 +18,4 @@ ADC/编码器/PWM BSP  <->  foc_port.h  <->  FOC 算法核  <->  APP 模式与�
 
 ## 下一阶段
 
-为 `foc_math` 添加主机单元测试，验证 Park 后再反 Park 的误差；测试通过后才加入 SVPWM 和 STM32F103 的 `foc_port_stm32f1_hal.c`。
+若后续开展移植，可基于当前 `Drivers/FOC/` 中的实现整理平台依赖、添加主机数学测试，再实现并接入具体 MCU 的 Port；这是后续计划，不代表当前已有可直接用于 TI/NXP 的实现。当前运行工程已经包含 SVPWM，不需要为了匹配本草稿重新实现一遍。

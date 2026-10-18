@@ -1,0 +1,37 @@
+# Keil build outputs: never publish compiler logs or local license information.
+/MDK-ARM/OLED/
+**/Objects/
+**/Listings/
+*.o
+*.obj
+*.d
+*.crf
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.lnp
+*.sct.bak
+*.build_log.htm
+
+# Machine-specific IDE, debugger and session files.
+.vscode/
+*.uvguix.*
+*.uvoptx
+*.uvopt
+/MDK-ARM/DebugConfig/
+
+# Local secrets and temporary files. Keep vendor licenses and source libraries.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.bak
+*.tmp
+*.swp
+~$*
+Thumbs.db
+.DS_Store
